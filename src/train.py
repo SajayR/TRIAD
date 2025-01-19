@@ -241,7 +241,7 @@ class TextVisualTrainer:
                 #    So the remaining updates is total_updates - self.global_update
                 steps_remaining = self.total_updates - self.global_update
                 # Potentially reduce the text LR further if it still explodes
-                text_max_lr = self.config['learning_rate'] * 0.1
+                text_max_lr = self.config['learning_rate'] * 0.069
 
                 self.scheduler_text = torch.optim.lr_scheduler.OneCycleLR(
                     self.optimizer_text,
@@ -260,7 +260,7 @@ class TextVisualTrainer:
 
             if self.scheduler_vit is None:
                 steps_remaining = self.total_updates - self.global_update
-                vit_max_lr = self.config['learning_rate'] * 0.2
+                vit_max_lr = self.config['learning_rate'] * 0.069
 
                 self.scheduler_vit = torch.optim.lr_scheduler.OneCycleLR(
                     self.optimizer_vit,
@@ -430,17 +430,17 @@ if __name__ == "__main__":
     trainer = TextVisualTrainer(
         hf_dataset=dset,
         output_dir='./outputs',
-        batch_size=40,
+        batch_size=38,
         num_epochs=30,
         learning_rate=1e-4,
         use_wandb=True,
         num_vis_samples=15,
         gradient_accumulation_steps=2,
-        vis_every=1000,
+        vis_every=3000,
         num_workers=12,
         force_new_training=True,
-        unfreeze_text_epoch=1,
-        unfreeze_vit_epoch=5,
+        unfreeze_text_epoch=2,
+        unfreeze_vit_epoch=10,
         save_every_steps=3000
     )
     

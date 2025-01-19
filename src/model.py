@@ -7,8 +7,8 @@ class TextEmbedder(nn.Module):
     def __init__(self, embedding_dim=512, model_name="roberta-base"):
         super().__init__()
         # Example: using BERT instead of Roberta
-        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        self.encoder = AutoModel.from_pretrained("bert-base-uncased")
+        self.tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base") #bert-base-uncased
+        self.encoder = AutoModel.from_pretrained("answerdotai/ModernBERT-base")
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
         
         # Keep all parameters trainable
