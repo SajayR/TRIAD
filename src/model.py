@@ -6,9 +6,8 @@ from transformers import AutoTokenizer, AutoModel
 class TextEmbedder(nn.Module):
     def __init__(self, embedding_dim=512, model_name="roberta-base"):
         super().__init__()
-        #self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        #self.encoder = AutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  # or bert-base-cased
+        # Example: using BERT instead of Roberta
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
         self.encoder = AutoModel.from_pretrained("bert-base-uncased")
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
         
@@ -49,12 +48,16 @@ class TextEmbedder(nn.Module):
         # Return both features and attention mask so we can do masked operations
         return features, inputs["attention_mask"]
 
+
 class ViTEmbedder(nn.Module):
-    def __init__(self, model_name='vit_base_patch16_224', pretrained=True):
+    def __init__(self, model_name='vit_base_patch16_224', pretrained=True, dropout_prob=0.1):
         super().__init__()
         # Example: Using DINOv2 from Facebook's hub
         self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         self.projection = nn.Linear(self.model.embed_dim, 512)
+
+        # Visual dropout
+        self.dropout = nn.Dropout(p=dropout_prob)
         
         for param in self.model.parameters():
             param.requires_grad = True
@@ -68,17 +71,36 @@ class ViTEmbedder(nn.Module):
         """
         # Get only the first intermediate layer
         x = self.model.get_intermediate_layers(x, n=1)[0]
+        
+        # Project and drop out
         x = self.projection(x)
+        x = self.dropout(x)
         return x
 
+
 class TextVisualModel(nn.Module):
-    def __init__(self, temperature=2.0):
+    def __init__(
+        self, 
+        temperature=2.0, 
+        patch_sparsity_threshold=0.3, 
+        patch_sparsity_weight=0.1, 
+        visual_dropout_prob=0.1
+    ):
         super().__init__()
         
-        self.visual_embedder = ViTEmbedder()  
+        # Insert the dropout probability in ViTEmbedder
+        self.visual_embedder = ViTEmbedder(dropout_prob=visual_dropout_prob)
         self.text_embedder = TextEmbedder()
-        #self.temperature = nn.Parameter(torch.tensor(temperature))
         
+        # Sparsity hyperparams
+        self.patch_sparsity_threshold = patch_sparsity_threshold
+        self.patch_sparsity_weight = patch_sparsity_weight
+
+        # If you want to keep a trainable temperature, uncomment below:
+        # self.temperature = nn.Parameter(torch.tensor(temperature))
+        # else you can keep it as a constant:
+        #self.temperature = temperature
+
     def compute_similarity_matrix(self, text_feats, visual_feats):
         """
         Compute pairwise cosine similarities between text and visual tokens
@@ -93,20 +115,13 @@ class TextVisualModel(nn.Module):
         text_feats = F.normalize(text_feats, dim=-1)
         visual_feats = F.normalize(visual_feats, dim=-1)
         similarity = torch.bmm(text_feats, visual_feats.transpose(1, 2))  # (B, Nt, Nv)
-        return similarity# / self.temperature
+        return similarity
     
     def aggregate_token_similarities(self, similarity_matrix, attention_mask):
         """
         After computing similarity_matrix = (B, Nt, Nv), we:
           1) Take the max over visual dimension => (B, Nt).
           2) Compute the mean over text tokens, *excluding padding* based on attention_mask.
-        
-        Args:
-            similarity_matrix: (B, Nt, Nv)
-            attention_mask: (B, Nt), 1=valid token, 0=padding
-        
-        Returns:
-            clip_similarity: (B,) masked mean for each item in batch
         """
         # (B, Nt)
         max_similarities = torch.max(similarity_matrix, dim=2)[0]
@@ -126,19 +141,11 @@ class TextVisualModel(nn.Module):
     def compute_all_similarities(self, text_feats, visual_feats, attention_mask):
         """
         Compute similarities between all pairs of text and visual features in the batch
-        for contrastive learning. Returns:
+        for contrastive learning. 
+        Returns:
           - clip_sims: (B, B) aggregated similarity for each pair in the batch
           - token_sims: (B, B, Nt, Nv) raw token-level similarities
         We do a masked mean along the text tokens dimension to get clip_sims.
-        
-        Args:
-            text_feats: (B, Nt, D)
-            visual_feats: (B, Nv, D)
-            attention_mask: (B, Nt)
-        
-        Returns:
-            clip_sims: (B, B)
-            token_sims: (B, B, Nt, Nv)
         """
         B = text_feats.shape[0]
         
@@ -152,7 +159,7 @@ class TextVisualModel(nn.Module):
         visual_feats = F.normalize(visual_feats, dim=-1)
         
         # token_sims: (B, B, Nt, Nv)
-        token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3))# / self.temperature
+        token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3)) 
         
         # Take the max over visual tokens => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
@@ -185,31 +192,50 @@ class TextVisualModel(nn.Module):
         losses_v2t = -log_prob_v2t[torch.arange(batch_size), labels]
         
         contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
-        reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)    
+
+        # Add our regularization terms
+        reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)
+        
         total_loss = contrastive_loss + reg_loss
         return total_loss
     
     def compute_regularization_losses(self, clip_sims, token_sims):
         """
-        Example regularization that keeps negative token_sims near zero
-        and temperature in [2.3, 4.0].
+        1) Force negative sims near zero (existing approach).
+        2) Patch usage sparsity: if a patch is used by > threshold fraction of tokens, penalize it.
         """
-        # Force negative sims near zero
-        neg_sims = torch.clamp(token_sims, min=-20, max=0)  
+        # --- (1) Negative sims near zero ---
+        # We only penalize negative values in token_sims (any of them across the batch).
+        neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims ** 2)
         
-        # Temperature calibration
-        '''temp_low = torch.clamp(
-            torch.log(torch.tensor(1, device=token_sims.device)) 
-            - torch.log(self.temperature), min=0
-        ) ** 4
-        temp_high = torch.clamp(
-            torch.log(self.temperature) 
-            - torch.log(torch.tensor(2.5, device=token_sims.device)), min=0
-        ) ** 4
-        l_cal = temp_low + temp_high '''
+        # --- (2) Patch usage sparsity ---
+        # We'll compute soft usage for the "correct" pairs only (diagonal of token_sims).
+        # token_sims has shape (B, B, Nt, Nv).
+        B = token_sims.shape[0]
+        positive_sims = []
+        for i in range(B):
+            # shape (Nt, Nv)
+            positive_sims.append(token_sims[i, i])
+        # Stack => (B, Nt, Nv)
+        positive_sims = torch.stack(positive_sims, dim=0)
 
-        reg_loss = 0.15 * l_nonneg #(8.0 * l_cal + 0.15 * l_nonneg)
+        # Now take a softmax over the patches dimension => (B, Nt, Nv)
+        patch_probs = F.softmax(positive_sims, dim=-1)
+
+        # patch_fraction[b, v] = fraction of text tokens that (softly) pick patch v
+        # shape => (B, Nv)
+        patch_fraction = patch_probs.sum(dim=1) / patch_probs.shape[1]
+
+        # For each patch, if fraction > threshold, penalize (we do a ReLU).
+        # shape => (B, Nv)
+        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)
+
+        # We can do a squared penalty or linear. Example: squared:
+        loss_sparsity = (excess ** 2).mean()
+
+        # Weighted sum of negative sims penalty + patch usage penalty
+        reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
         return reg_loss
         
     def forward(self, frames, texts):
@@ -217,7 +243,7 @@ class TextVisualModel(nn.Module):
         Forward pass computing embeddings, similarities and loss
         
         Args:
-            frames: (B, C, H, W) batch of images/frames
+            frames: (B, C, H, W) batch of images
             texts: List[str] batch of text inputs
             
         Returns:
@@ -237,17 +263,23 @@ class TextVisualModel(nn.Module):
         else:
             # Inference path: compute pairwise sim for each item and do masked mean
             sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats) # (B, Nt, Nv)
-            # If you want the final aggregated similarity per item:
-            #clip_similarity = self.aggregate_token_similarities(sim_matrix, attention_mask)
             return sim_matrix, attention_mask
 
+
 if __name__ == "__main__":
-    model = TextVisualModel()
+    # Example usage
+    model = TextVisualModel(
+        temperature=2.0,
+        patch_sparsity_threshold=0.3,
+        patch_sparsity_weight=0.1,
+        visual_dropout_prob=0.1
+    )
+    
     batch_size = 4
     frames = torch.randn(batch_size, 3, 224, 224)
     texts = ["a dog running", "cat sleeping", "bird flying", "fish swimming"]
     
-    # Training mode2
+    # Training mode
     model.train()
     loss = model(frames, texts)
     print(f"Training loss: {loss.item()}")

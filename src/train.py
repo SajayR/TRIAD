@@ -49,7 +49,12 @@ class TextVisualTrainer:
         self.use_wandb = use_wandb
         
         # Initialize model and move to device
-        self.model = TextVisualModel().to(device)
+        self.model = TextVisualModel(
+            temperature=2.0,
+            patch_sparsity_threshold=0.3,
+            patch_sparsity_weight=0.1,
+            visual_dropout_prob=0.1
+        ).to(device)
         
         # Training config
         self.config = {
@@ -321,7 +326,7 @@ class TextVisualTrainer:
                 # only step optimizers + schedulers after the desired # of accumulation steps
                 if accumulation_counter % self.config['gradient_accumulation_steps'] == 0:
                     # Clip gradients to help prevent exploding
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     
                     # 🔴 Step each optimizer *and* increment self.global_update 
                     self.optimizer_projection.step()
