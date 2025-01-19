@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gc
 import warnings
+import math
 import datasets
 warnings.filterwarnings("ignore")
 
@@ -74,7 +75,11 @@ class TextVisualTrainer:
 
         # Initialize training state
         self.start_epoch = 0
-        self.global_step = 0
+
+        # 🔴 We have TWO counters now:
+        self.global_step = 0   # increments EVERY batch
+        self.global_update = 0 # increments EVERY optimizer step
+
         self.best_loss = float('inf')
 
         # Setup dataset and dataloader
@@ -89,7 +94,7 @@ class TextVisualTrainer:
             prefetch_factor=6
         )
 
-        # Initially freeze backbone models
+        # Freeze backbone models initially
         for param in self.model.visual_embedder.model.parameters():
             param.requires_grad = False
         for param in self.model.text_embedder.encoder.parameters():
@@ -113,11 +118,18 @@ class TextVisualTrainer:
             else:
                 projection_params.append(param)
 
+        # 🔴 Calculate the REAL total number of optimizer updates (not mini‐batches):
+        steps_per_epoch = len(self.dataloader)
+        self.updates_per_epoch = math.ceil(steps_per_epoch / gradient_accumulation_steps)
+        self.total_updates = self.updates_per_epoch * num_epochs
+
         # Setup optimizers
         self.optimizer_projection = torch.optim.AdamW([
             {'params': projection_params, 'lr': learning_rate},
-            {'params': temperature_params, 'lr': learning_rate}
+            #{'params': temperature_params, 'lr': learning_rate}
         ])
+        
+        # If text/ViT get 0.1*LR, you might consider lowering that further e.g. 0.01 if still exploding
         self.optimizer_text = torch.optim.AdamW(
             [{'params': text_params, 'lr': learning_rate * 0.1}]
         )
@@ -125,14 +137,11 @@ class TextVisualTrainer:
             [{'params': vit_params, 'lr': learning_rate * 0.1}]
         )
 
-        # Setup schedulers
-        steps_per_epoch = len(self.dataloader)
-        total_steps = steps_per_epoch * num_epochs
-
+        # 🔴 Setup the projection's OneCycle scheduler with total number of UPDATES:
         self.scheduler_projection = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer_projection,
             max_lr=learning_rate,
-            total_steps=total_steps,
+            total_steps=self.total_updates,
             pct_start=0.1,
             div_factor=10,
             final_div_factor=1e4,
@@ -142,7 +151,7 @@ class TextVisualTrainer:
         self.scheduler_text = None
         self.scheduler_vit = None
 
-        # Setup visualization
+        # Visualization
         self.visualizer = TextVisualizer()
         self.vis_samples = self._get_visualization_samples()
 
@@ -169,7 +178,8 @@ class TextVisualTrainer:
         
         checkpoint = {
             'epoch': epoch,
-            'step': step,
+            'step': step,  # batch-wise step
+            'update': self.global_update,  # how many times we stepped optim
             'model_state_dict': self.model.state_dict(),
             'optimizer_projection_state_dict': self.optimizer_projection.state_dict(),
             'optimizer_text_state_dict': self.optimizer_text.state_dict(),
@@ -198,41 +208,62 @@ class TextVisualTrainer:
             self.scheduler_projection.load_state_dict(checkpoint['scheduler_projection_state_dict'])
         
         self.start_epoch = checkpoint['epoch']
-        self.global_step = checkpoint['step']
+        self.global_step = checkpoint['step']   # batch-level
+        self.global_update = checkpoint.get('update', 0)  # how many times we've stepped optim
         self.best_loss = checkpoint['best_loss']
         self.vis_samples = checkpoint['vis_samples']
         
+        # Make sure we get the right freeze state after loading
         self._set_freeze_state(self.start_epoch)
+
+        # Now if text/vit schedulers were in the checkpoint, load them
+        if checkpoint.get('scheduler_text_state_dict'):
+            if self.scheduler_text is not None:
+                self.scheduler_text.load_state_dict(checkpoint['scheduler_text_state_dict'])
+        if checkpoint.get('scheduler_vit_state_dict'):
+            if self.scheduler_vit is not None:
+                self.scheduler_vit.load_state_dict(checkpoint['scheduler_vit_state_dict'])
 
     def _set_freeze_state(self, current_epoch: int):
         """Update which parameters are frozen based on current epoch"""
+        # If it's time to unfreeze text
         if current_epoch >= self.config['unfreeze_text_epoch']:
             for param in self.model.text_embedder.encoder.parameters():
                 param.requires_grad = True
+            
             if self.scheduler_text is None:
-                steps_remaining = (self.config['num_epochs'] - current_epoch) * len(self.dataloader)
+                # 🔴 We still want to schedule across remaining *updates*, not batches.
+                #    So the remaining updates is total_updates - self.global_update
+                steps_remaining = self.total_updates - self.global_update
+                # Potentially reduce the text LR further if it still explodes
+                text_max_lr = self.config['learning_rate'] * 0.1
+
                 self.scheduler_text = torch.optim.lr_scheduler.OneCycleLR(
                     self.optimizer_text,
-                    max_lr=self.config['learning_rate'] * 0.1,
+                    max_lr=text_max_lr,
                     total_steps=steps_remaining,
-                    pct_start=0.1,
-                    div_factor=10,
-                    final_div_factor=1e4,
+                    pct_start=0.3,
+                    div_factor=1000,
+                    final_div_factor=1e3,
                     anneal_strategy='cos'
                 )
 
+        # If it's time to unfreeze the visual encoder
         if current_epoch >= self.config['unfreeze_vit_epoch']:
             for param in self.model.visual_embedder.model.parameters():
                 param.requires_grad = True
+
             if self.scheduler_vit is None:
-                steps_remaining = (self.config['num_epochs'] - current_epoch) * len(self.dataloader)
+                steps_remaining = self.total_updates - self.global_update
+                vit_max_lr = self.config['learning_rate'] * 0.2
+
                 self.scheduler_vit = torch.optim.lr_scheduler.OneCycleLR(
                     self.optimizer_vit,
-                    max_lr=self.config['learning_rate'] * 0.1,
+                    max_lr=vit_max_lr,
                     total_steps=steps_remaining,
-                    pct_start=0.1,
-                    div_factor=10,
-                    final_div_factor=1e4,
+                    pct_start=0.2,
+                    div_factor=100,
+                    final_div_factor=1e3,
                     anneal_strategy='cos'
                 )
 
@@ -266,38 +297,51 @@ class TextVisualTrainer:
                 images = batch['images'].to(self.device)
                 captions = batch['captions']
                 
+                # forward pass
                 loss = self.model(images, captions)
-                
-                if loss.item() > 10:
-                    print(f"Skipping batch with loss: {loss.item():.4f}")
+
+                if loss.item()>15:
+                    print(f"Skipping batch with loss {loss.item()}")
+                    continue
+                #check if loss is nan
+                if torch.isnan(loss):
+                    print(f"Skipping batch with nan loss")
+                    continue
+                #check if loss is inf
+                if torch.isinf(loss):
+                    print(f"Skipping batch with inf loss")
                     continue
                 
-                # Gradient accumulation
+                # gradient accumulation
                 loss = loss / self.config['gradient_accumulation_steps']
                 loss.backward()
                 
                 accumulation_counter += 1
                 
+                # only step optimizers + schedulers after the desired # of accumulation steps
                 if accumulation_counter % self.config['gradient_accumulation_steps'] == 0:
-                    # Clip gradients
+                    # Clip gradients to help prevent exploding
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                     
-                    # Step optimizers
+                    # 🔴 Step each optimizer *and* increment self.global_update 
                     self.optimizer_projection.step()
-                    self.scheduler_projection.step()
+                    self.optimizer_projection.zero_grad()
                     
+                    self.scheduler_projection.step()  # step projection scheduler
                     if epoch >= self.config['unfreeze_text_epoch']:
                         self.optimizer_text.step()
-                        self.scheduler_text.step()
-                    
+                        self.optimizer_text.zero_grad()
+                        if self.scheduler_text is not None:
+                            self.scheduler_text.step()
+
                     if epoch >= self.config['unfreeze_vit_epoch']:
                         self.optimizer_vit.step()
-                        self.scheduler_vit.step()
-                    
-                    # Zero gradients
-                    self.optimizer_projection.zero_grad()
-                    self.optimizer_text.zero_grad()
-                    self.optimizer_vit.zero_grad()
+                        self.optimizer_vit.zero_grad()
+                        if self.scheduler_vit is not None:
+                            self.scheduler_vit.step()
+
+                    # 🔴 increment the number of optimizer updates
+                    self.global_update += 1
                 
                 # Logging
                 loss_value = loss.item() * self.config['gradient_accumulation_steps']
@@ -307,10 +351,12 @@ class TextVisualTrainer:
                 if self.use_wandb:
                     log_dict = {
                         "train_loss": loss_value,
-                        "temperature": self.model.temperature.item(),
+                        #"temperature": self.model.temperature.item(),
+                        # show LR from projection (param group 0)
                         "projection_lr": self.optimizer_projection.param_groups[0]['lr'],
                         "epoch": epoch,
-                        "step": self.global_step
+                        "global_batch_step": self.global_step,
+                        "global_update_step": self.global_update,
                     }
                     
                     if epoch >= self.config['unfreeze_text_epoch']:
@@ -319,6 +365,9 @@ class TextVisualTrainer:
                         log_dict["vit_lr"] = self.optimizer_vit.param_groups[0]['lr']
                     
                     wandb.log(log_dict)
+                
+                # increment the number of *batches* processed
+                self.global_step += 1
                 
                 # Cleanup
                 del images, loss
@@ -339,7 +388,6 @@ class TextVisualTrainer:
                                 output_path=self.output_dir / f'viz_epoch{epoch}_step{self.global_step}_sample{i}.png'
                             )
                             if self.use_wandb:
-                                # Open the saved image and log to wandb
                                 wandb.log({
                                     f"token_attention_sample_{i}": wandb.Image(
                                         str(self.output_dir / f'viz_epoch{epoch}_step{self.global_step}_sample{i}.png'),
@@ -354,8 +402,6 @@ class TextVisualTrainer:
                 
                 if self.global_step % self.config['save_every_steps'] == 0:
                     self.save_checkpoint(epoch, self.global_step)
-                
-                self.global_step += 1
             
             # End of epoch
             epoch_loss = np.mean(epoch_losses)
@@ -370,6 +416,7 @@ class TextVisualTrainer:
             self.save_checkpoint(epoch, self.global_step)
         
         print("Training completed!")
+
 
 if __name__ == "__main__":
     # Load dataset
@@ -386,9 +433,9 @@ if __name__ == "__main__":
         gradient_accumulation_steps=2,
         vis_every=1000,
         num_workers=12,
-        force_new_training=False,
-        unfreeze_text_epoch=1,  # Start fine-tuning text encoder after 5 epochs
-        unfreeze_vit_epoch=5,  # Start fine-tuning ViT after 10 epochs
+        force_new_training=True,
+        unfreeze_text_epoch=1,
+        unfreeze_vit_epoch=5,
         save_every_steps=3000
     )
     

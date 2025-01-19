@@ -6,8 +6,10 @@ from transformers import AutoTokenizer, AutoModel
 class TextEmbedder(nn.Module):
     def __init__(self, embedding_dim=512, model_name="roberta-base"):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.encoder = AutoModel.from_pretrained(model_name)
+        #self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        #self.encoder = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  # or bert-base-cased
+        self.encoder = AutoModel.from_pretrained("bert-base-uncased")
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
         
         # Keep all parameters trainable
@@ -75,7 +77,7 @@ class TextVisualModel(nn.Module):
         
         self.visual_embedder = ViTEmbedder()  
         self.text_embedder = TextEmbedder()
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        #self.temperature = nn.Parameter(torch.tensor(temperature))
         
     def compute_similarity_matrix(self, text_feats, visual_feats):
         """
@@ -91,7 +93,7 @@ class TextVisualModel(nn.Module):
         text_feats = F.normalize(text_feats, dim=-1)
         visual_feats = F.normalize(visual_feats, dim=-1)
         similarity = torch.bmm(text_feats, visual_feats.transpose(1, 2))  # (B, Nt, Nv)
-        return similarity / self.temperature
+        return similarity# / self.temperature
     
     def aggregate_token_similarities(self, similarity_matrix, attention_mask):
         """
@@ -150,7 +152,7 @@ class TextVisualModel(nn.Module):
         visual_feats = F.normalize(visual_feats, dim=-1)
         
         # token_sims: (B, B, Nt, Nv)
-        token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3)) / self.temperature
+        token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3))# / self.temperature
         
         # Take the max over visual tokens => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
@@ -197,7 +199,7 @@ class TextVisualModel(nn.Module):
         l_nonneg = torch.mean(neg_sims ** 2)
         
         # Temperature calibration
-        temp_low = torch.clamp(
+        '''temp_low = torch.clamp(
             torch.log(torch.tensor(1, device=token_sims.device)) 
             - torch.log(self.temperature), min=0
         ) ** 4
@@ -205,9 +207,9 @@ class TextVisualModel(nn.Module):
             torch.log(self.temperature) 
             - torch.log(torch.tensor(2.5, device=token_sims.device)), min=0
         ) ** 4
-        l_cal = temp_low + temp_high 
+        l_cal = temp_low + temp_high '''
 
-        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)
+        reg_loss = 0.15 * l_nonneg #(8.0 * l_cal + 0.15 * l_nonneg)
         return reg_loss
         
     def forward(self, frames, texts):
