@@ -153,6 +153,8 @@ class TextVisualTrainer:
                 self.load_checkpoint(checkpoint_path)
             else:
                 wandb.init(project="TextVisualAlignment", config=self.config)
+        if use_wandb and wandb.run is None:
+            wandb.init(project="TextVisualAlignment", config=self.config)
 
     def find_latest_checkpoint(self):
         """Find the latest checkpoint in output directory"""
@@ -376,17 +378,17 @@ if __name__ == "__main__":
     trainer = TextVisualTrainer(
         hf_dataset=dset,
         output_dir='./outputs',
-        batch_size=64,
+        batch_size=40,
         num_epochs=30,
         learning_rate=1e-4,
         use_wandb=True,
         num_vis_samples=15,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2,
         vis_every=1000,
         num_workers=12,
         force_new_training=False,
         unfreeze_text_epoch=1,  # Start fine-tuning text encoder after 5 epochs
-        unfreeze_vit_epoch=3,  # Start fine-tuning ViT after 10 epochs
+        unfreeze_vit_epoch=5,  # Start fine-tuning ViT after 10 epochs
         save_every_steps=3000
     )
     
