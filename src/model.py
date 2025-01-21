@@ -112,8 +112,8 @@ class TextVisualModel(nn.Module):
         Returns:
             similarity_matrix: (B, Nt, Nv)
         """
-        text_feats = F.normalize(text_feats, dim=-1)
-        visual_feats = F.normalize(visual_feats, dim=-1)
+        #text_feats = F.normalize(text_feats, dim=-1)
+        #visual_feats = F.normalize(visual_feats, dim=-1)
         similarity = torch.bmm(text_feats, visual_feats.transpose(1, 2))  # (B, Nt, Nv)
         return similarity
     
@@ -155,8 +155,8 @@ class TextVisualModel(nn.Module):
         # visual_feats -> (1, B, Nv, D) -> (B, B, Nv, D)
         visual_feats = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         
-        text_feats = F.normalize(text_feats, dim=-1)
-        visual_feats = F.normalize(visual_feats, dim=-1)
+        #text_feats = F.normalize(text_feats, dim=-1)
+        #visual_feats = F.normalize(visual_feats, dim=-1)
         
         # token_sims: (B, B, Nt, Nv)
         token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3)) 
@@ -197,7 +197,7 @@ class TextVisualModel(nn.Module):
         reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)
         
         total_loss = contrastive_loss + reg_loss
-        return total_loss
+        return total_loss, contrastive_loss, reg_loss
     
     def compute_regularization_losses(self, clip_sims, token_sims):
         """
@@ -270,8 +270,8 @@ if __name__ == "__main__":
     # Example usage
     model = TextVisualModel(
         temperature=2.0,
-        patch_sparsity_threshold=0.3,
-        patch_sparsity_weight=0.1,
+        patch_sparsity_threshold=0.4,
+        patch_sparsity_weight=0.4,
         visual_dropout_prob=0.1
     )
     

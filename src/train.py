@@ -166,9 +166,9 @@ class TextVisualTrainer:
             if checkpoint_path:
                 self.load_checkpoint(checkpoint_path)
             else:
-                wandb.init(project="TextVisualAlignment", config=self.config)
+                wandb.init(project="unculturedalignment", config=self.config)
         if use_wandb and wandb.run is None:
-            wandb.init(project="TextVisualAlignment", config=self.config)
+            wandb.init(project="unculturedalignment", config=self.config)
 
     def find_latest_checkpoint(self):
         """Find the latest checkpoint in output directory"""
@@ -303,11 +303,11 @@ class TextVisualTrainer:
                 captions = batch['captions']
                 
                 # forward pass
-                loss = self.model(images, captions)
+                loss, contrastive_loss, reg_loss = self.model(images, captions)
 
-                if loss.item()>15:
-                    print(f"Skipping batch with loss {loss.item()}")
-                    continue
+                #if loss.item()>15:
+                 #   print(f"Skipping batch with loss {loss.item()}")
+                 #   continue
                 #check if loss is nan
                 if torch.isnan(loss):
                     print(f"Skipping batch with nan loss")
@@ -350,12 +350,16 @@ class TextVisualTrainer:
                 
                 # Logging
                 loss_value = loss.item() * self.config['gradient_accumulation_steps']
+                contrastive_loss_value = contrastive_loss.item() * self.config['gradient_accumulation_steps']
+                reg_loss_value = reg_loss.item() * self.config['gradient_accumulation_steps']
                 epoch_losses.append(loss_value)
                 pbar.set_postfix({'loss': f'{loss_value:.4f}'})
                 
                 if self.use_wandb:
                     log_dict = {
                         "train_loss": loss_value,
+                        "contrastive_loss": contrastive_loss_value,
+                        "reg_loss": reg_loss_value,
                         #"temperature": self.model.temperature.item(),
                         # show LR from projection (param group 0)
                         "projection_lr": self.optimizer_projection.param_groups[0]['lr'],
@@ -430,7 +434,7 @@ if __name__ == "__main__":
     trainer = TextVisualTrainer(
         hf_dataset=dset,
         output_dir='./outputs',
-        batch_size=38,
+        batch_size=32,
         num_epochs=30,
         learning_rate=1e-4,
         use_wandb=True,
@@ -439,8 +443,8 @@ if __name__ == "__main__":
         vis_every=3000,
         num_workers=12,
         force_new_training=True,
-        unfreeze_text_epoch=2,
-        unfreeze_vit_epoch=10,
+        unfreeze_text_epoch=3,
+        unfreeze_vit_epoch=3,
         save_every_steps=3000
     )
     
