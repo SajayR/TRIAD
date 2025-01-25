@@ -73,9 +73,9 @@ class MultiModalTrainer:
         use_wandb: bool = True,
         project_name: str = "UnifiedMultiModal",
         vis_every: int = 1000,
-        num_vis_samples_av: int = 2,
-        num_vis_samples_tv: int = 2,
-        save_every_steps: int = 3000,
+        num_vis_samples_av: int = 10,
+        num_vis_samples_tv: int = 10,
+        save_every_steps: int = 10000,
         num_workers: int = 4,
         device: str = "cuda",
         force_new_training: bool = False
@@ -403,7 +403,7 @@ class MultiModalTrainer:
             pbar = tqdm(range(max_steps), desc=f"Epoch {epoch}")
             for _ in pbar:
                 # 1) Get a batch from AV data
-                start_time = time.time()
+                #start_time = time.time()
                 try:
                     av_batch = next(self.av_iter)
                 except StopIteration:
@@ -422,18 +422,23 @@ class MultiModalTrainer:
 
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv = tv_batch['captions']
-                retrieval_time = time.time() - start_time
-                print(f"Retrieval time: {retrieval_time:.2f} seconds")
+                #retrieval_time = time.time() - start_time
+                #print(f"Retrieval time: {retrieval_time:.2f} seconds")
+                #retrieval_time = time.time()
                 # 3) Forward pass for both tasks => sum
                 self.model.train()
                 loss_av = self.model.forward_audio_visual(frames_av, audio)
                 loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
                 loss_total = loss_av + loss_tv
-                forward_time = time.time() - retrieval_time
-                print(f"Forward time: {forward_time:.2f} seconds")
+                #forward_time = time.time() - retrieval_time
+                #print(f"Forward time: {forward_time:.2f} seconds")
+                #forward_time = time.time()
                 # Accumulate
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
+                #backward_time = time.time() - forward_time
+                #print(f"Backward time: {backward_time:.2f} seconds")
+                #backward_time = time.time()
                 accumulation_counter += 1
 
                 # Step after enough accumulation
@@ -478,8 +483,8 @@ class MultiModalTrainer:
                 if self.global_step % self.save_every_steps == 0:
                     self.save_checkpoint(epoch, self.global_step)
 
-                end_time = time.time()
-                print(f"Time for step {self.global_step}: {end_time - start_time:.2f} seconds")
+                #end_time = time.time()
+                #print(f"Time for step {self.global_step}: {end_time - start_time:.2f} seconds")
                 
 
             # End epoch
@@ -564,12 +569,20 @@ if __name__ == "__main__":
         batch_size_tv=24,
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=True,   # set True to use W&B
+        use_wandb=False,   # set True to use W&B
         force_new_training=True,
-        vis_every=50,
-        save_every_steps=1000,
-        num_workers=12,
-        device="cuda"
+        vis_every=5000,
+        save_every_steps=10000,
+        num_workers=8,
+        device="cuda",
+        gradient_accumulation_steps=2,
+        unfreeze_audio_epoch=1,
+        unfreeze_text_epoch=1,
+        unfreeze_vit_epoch=1,
+        project_name="Triad",
+        num_vis_samples_av=10,
+        num_vis_samples_tv=10,
     )
 
     trainer.train()
+
