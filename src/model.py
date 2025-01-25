@@ -1,291 +1,471 @@
+# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+import warnings
+from transformers import (
+    HubertModel, 
+    AutoProcessor, 
+    AutoTokenizer, 
+    AutoModel
+)
+warnings.filterwarnings("ignore")
 
-class TextEmbedder(nn.Module):
-    def __init__(self, embedding_dim=512, model_name="roberta-base"):
+
+#################################################################
+#                   Audio Embedder
+#################################################################
+class AudioEmbedder(nn.Module):
+    """
+    Uses a pre-trained HuBERT (or similar) to extract audio features from raw audio (16kHz).
+    Projects them down to a desired embedding dimension.
+    """
+    def __init__(self, embedding_dim=512, hubert_name="facebook/hubert-base-ls960"):
         super().__init__()
-        # Example: using BERT instead of Roberta
-        self.tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base") #bert-base-uncased
-        self.encoder = AutoModel.from_pretrained("answerdotai/ModernBERT-base")
+        self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")  
+        self.hubert = HubertModel.from_pretrained(hubert_name)
+        self.projection = nn.Linear(self.hubert.config.hidden_size, embedding_dim)
+        
+        for param in self.hubert.parameters():
+            param.requires_grad = True
+        for param in self.projection.parameters():
+            param.requires_grad = True
+        
+    def forward(self, audio_input: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            audio_input: (B, T) raw audio waveform at 16kHz
+            
+        Returns:
+            audio_feats: (B, Na, D) 
+                B = batch size
+                Na = number of audio tokens (T/320 for Hubert)
+                D = embedding_dim
+        """
+        # Convert raw wave to the model's input format
+        # NOTE: We do a batch at a time. If your collate function 
+        #       produces shape [B, T], this is fine. 
+        inputs = self.processor(
+            audio_input, 
+            return_tensors="pt",
+            sampling_rate=16000,
+            padding=True,
+            return_attention_mask=True
+        ).input_values.squeeze(0)
+        # Move everything to the same device as self
+        device = next(self.parameters()).device
+        inputs = inputs.to(device)
+        
+        # Forward pass of HuBERT
+        hubert_output = self.hubert(inputs).last_hidden_state  # (B, T', hidden_size)
+        
+        # Project to the desired dimension
+        audio_feats = self.projection(hubert_output)  # (B, T', D)
+        
+        return audio_feats
+
+
+#################################################################
+#                   Text Embedder
+#################################################################
+class TextEmbedder(nn.Module):
+    """
+    Uses a pre-trained BERT-like model (ModernBERT or similar) to extract text features.
+    Projects them down to a desired embedding dimension.
+    """
+    def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base"):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.encoder = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
         
-        # Keep all parameters trainable
         for param in self.encoder.parameters():
             param.requires_grad = True
         for param in self.projection.parameters():
             param.requires_grad = True
         
-    def forward(self, text):
+    def forward(self, text_list):
         """
         Args:
-            text: List[str] batch of text inputs
+            text_list: List[str], batch of text inputs
             
         Returns:
-            features: (B, Nt, D) where:
-                B is batch size
-                Nt is number of text tokens
-                D is embedding_dim
+            text_feats: (B, Nt, D)
             attention_mask: (B, Nt)
         """
         inputs = self.tokenizer(
-            text, 
+            text_list, 
             padding=True,
             truncation=True,
-            max_length=128,  # Better parallelization with power of 2
-            add_special_tokens=False,  # No CLS/SEP tokens
+            add_special_tokens=False,
+            max_length=128,
             return_tensors="pt"
         )
-        # Move tokenizer outputs to same device as model
-        inputs = {k: v.to(next(self.encoder.parameters()).device) for k, v in inputs.items()}
+        device = next(self.parameters()).device
+        for k in inputs:
+            inputs[k] = inputs[k].to(device)
+
+        outputs = self.encoder(**inputs)  # last_hidden_state shape: (B, Nt, hidden_size)
+        hidden_states = outputs.last_hidden_state
+        text_feats = self.projection(hidden_states)  # (B, Nt, D)
         
-        # Encoded hidden states
-        outputs = self.encoder(**inputs)
-        hidden_states = outputs.last_hidden_state  # (B, Nt, hidden_size)
-        features = self.projection(hidden_states)  # (B, Nt, embedding_dim)
-        
-        # Return both features and attention mask so we can do masked operations
-        return features, inputs["attention_mask"]
+        return text_feats, inputs["attention_mask"]
 
 
+#################################################################
+#                   Visual Embedder
+#################################################################
 class ViTEmbedder(nn.Module):
-    def __init__(self, model_name='vit_base_patch16_224', pretrained=True, dropout_prob=0.1):
+    """
+    Example using DINOv2 from Facebook to extract patch embeddings from an image.
+    Then projects to a common dimension with a linear layer.
+    """
+    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vits14',
+                 embedding_dim=512, dropout_prob=0.1):
         super().__init__()
-        # Example: Using DINOv2 from Facebook's hub
-        self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-        self.projection = nn.Linear(self.model.embed_dim, 512)
-
-        # Visual dropout
-        self.dropout = nn.Dropout(p=dropout_prob)
+        # For minimal editing, we can load from torch.hub:
+        #   "facebookresearch/dinov2", "dinov2_vits14"
+        self.model = torch.hub.load(model_name, arch)
         
+        # Projection down to a 512-dim space (or your chosen dimension).
+        self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
+        
+        # Optional dropout if desired
+        self.dropout = nn.Dropout(p=dropout_prob)
+
         for param in self.model.parameters():
             param.requires_grad = True
-            
+
     def forward(self, x):
         """
         Args:
-            x: (batch_size, channels, height, width)
+            x: (B, 3, H, W), e.g. (B,3,224,224) image batch
         Returns:
-            patch_embeddings: (batch_size, num_patches, embedding_dim)
+            visual_feats: (B, Nv, D)
+                Nv = number of visual tokens
+                D  = embedding_dim
         """
-        # Get only the first intermediate layer
-        x = self.model.get_intermediate_layers(x, n=1)[0]
+        # Example from DINOv2, we can get just the last layer
+        # 'get_intermediate_layers(x, n=1)[0]' returns patch embeddings shape (B, Nv, embed_dim).
+        with torch.no_grad():
+            # If you want partial finetuning, remove the "no_grad" context:
+            # but let's keep it minimal. 
+            pass
+
+        patches = self.model.get_intermediate_layers(x, n=1)[0]  
+        # Project
+        feats = self.projection(patches)
+        # Optionally dropout
+        feats = self.dropout(feats)
         
-        # Project and drop out
-        x = self.projection(x)
-        x = self.dropout(x)
-        return x
+        return feats
 
 
-class TextVisualModel(nn.Module):
+#################################################################
+#                   Unified MultiModalModel
+#################################################################
+class MultiModalModel(nn.Module):
+    """
+    A unified model that contains:
+      - audio_embedder (HuBERT)
+      - text_embedder  (BERT-like)
+      - visual_embedder (DINOv2 or ViT)
+    We provide two main forward routines:
+      - forward_audio_visual(...)
+      - forward_text_visual(...)
+    Each returns either a contrastive loss if self.training == True,
+    or returns raw similarity matrices if self.training == False.
+
+    We do minimal changes from the original AudioVisualModel & TextVisualModel
+    to keep the code logic close to the proven methods.
+    """
     def __init__(
         self, 
-        temperature=2.0, 
-        patch_sparsity_threshold=0.3, 
-        patch_sparsity_weight=0.1, 
+        audio_model_name="facebook/hubert-base-ls960",
+        text_model_name="answerdotai/ModernBERT-base",
+        temperature=2.0,
+        patch_sparsity_threshold=0.3,
+        patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1
     ):
         super().__init__()
-        
-        # Insert the dropout probability in ViTEmbedder
-        self.visual_embedder = ViTEmbedder(dropout_prob=visual_dropout_prob)
-        self.text_embedder = TextEmbedder()
-        
-        # Sparsity hyperparams
+
+        # Encoders
+        self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
+        self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
+        self.visual_embedder = ViTEmbedder(arch='dinov2_vits14',
+                                           embedding_dim=512,
+                                           dropout_prob=visual_dropout_prob)
+
+        # If you want a trainable temperature, do:
+        #   self.temperature = nn.Parameter(torch.tensor(temperature))
+        # Or if you want a fixed scalar, store it as a float:
+        self.temperature = nn.Parameter(torch.tensor(temperature))
+
+        # Additional hyperparams for text-visual reg
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
 
-        # If you want to keep a trainable temperature, uncomment below:
-        # self.temperature = nn.Parameter(torch.tensor(temperature))
-        # else you can keep it as a constant:
-        #self.temperature = temperature
+    ######################################################
+    #               Shared Utilities
+    ######################################################
+    def compute_similarity_matrix(self, feats1, feats2):
+        """
+        Generic token-level dot-product similarity between feats1 and feats2.
+        feats1: (B, N1, D)
+        feats2: (B, N2, D)
+        Returns sim: (B, N1, N2)
+        """
+        # Optionally normalize here:
+        # feats1 = F.normalize(feats1, dim=-1)
+        # feats2 = F.normalize(feats2, dim=-1)
+        sim = torch.bmm(feats1, feats2.transpose(1, 2))
+        return sim / self.temperature
 
-    def compute_similarity_matrix(self, text_feats, visual_feats):
+    ######################################################
+    #               AUDIO-VISUAL PATH
+    ######################################################
+    def compute_all_similarities_av(self, audio_feats, visual_feats):
         """
-        Compute pairwise cosine similarities between text and visual tokens
+        Cross-batch approach: compute pairwise similarities for all 
+        (audio_i, visual_j) in the batch.
         
-        Args:
-            text_feats: (B, Nt, D)
-            visual_feats: (B, Nv, D)
+        audio_feats: (B, Na, D)
+        visual_feats: (B, Nv, D)
         
         Returns:
-            similarity_matrix: (B, Nt, Nv)
+            clip_sims: (B, B)  for the aggregated similarity
+            token_sims: (B, B, Na, Nv) raw token-level sims
         """
-        #text_feats = F.normalize(text_feats, dim=-1)
-        #visual_feats = F.normalize(visual_feats, dim=-1)
-        similarity = torch.bmm(text_feats, visual_feats.transpose(1, 2))  # (B, Nt, Nv)
-        return similarity
-    
-    def aggregate_token_similarities(self, similarity_matrix, attention_mask):
-        """
-        After computing similarity_matrix = (B, Nt, Nv), we:
-          1) Take the max over visual dimension => (B, Nt).
-          2) Compute the mean over text tokens, *excluding padding* based on attention_mask.
-        """
-        # (B, Nt)
-        max_similarities = torch.max(similarity_matrix, dim=2)[0]
-        
-        # Convert mask to float for multiplication
-        mask_f = attention_mask.float()
-        
-        # Sum only valid tokens
-        masked_sum = (max_similarities * mask_f).sum(dim=1)
-        # Count how many valid tokens
-        valid_tokens = mask_f.sum(dim=1).clamp(min=1e-7)
-        
-        # Final masked mean
-        clip_similarity = masked_sum / valid_tokens
-        return clip_similarity
-    
-    def compute_all_similarities(self, text_feats, visual_feats, attention_mask):
-        """
-        Compute similarities between all pairs of text and visual features in the batch
-        for contrastive learning. 
-        Returns:
-          - clip_sims: (B, B) aggregated similarity for each pair in the batch
-          - token_sims: (B, B, Nt, Nv) raw token-level similarities
-        We do a masked mean along the text tokens dimension to get clip_sims.
-        """
-        B = text_feats.shape[0]
-        
-        # Expand so we can compute cross similarities across the batch
-        # text_feats -> (B, 1, Nt, D) -> (B, B, Nt, D)
-        text_feats = text_feats.unsqueeze(1).expand(-1, B, -1, -1)
-        # visual_feats -> (1, B, Nv, D) -> (B, B, Nv, D)
-        visual_feats = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
-        
-        #text_feats = F.normalize(text_feats, dim=-1)
-        #visual_feats = F.normalize(visual_feats, dim=-1)
-        
-        # token_sims: (B, B, Nt, Nv)
-        token_sims = torch.matmul(text_feats, visual_feats.transpose(2, 3)) 
-        
-        # Take the max over visual tokens => (B, B, Nt)
+        B = audio_feats.shape[0]
+
+        # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
+        af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
+
+        # dot product => (B, B, Na, Nv)
+        # Optionally normalize before dot
+        token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
+
+        # Max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
-        
-        # Now we need a masked mean over Nt, but note attention_mask is shape (B, Nt).
-        # We must expand it along dimension 1 (because of cross-batch).
-        # attn_mask_expanded -> (B, 1, Nt) -> (B, B, Nt)
-        attn_mask_expanded = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        
-        masked_sum = (max_sims * attn_mask_expanded).sum(dim=2)  # (B, B)
-        valid_tokens = attn_mask_expanded.sum(dim=2).clamp(min=1e-7)  # (B, B)
-        
-        # Final clip_sims => (B, B)
-        clip_sims = masked_sum / valid_tokens
-        
+        # Then mean over audio dimension => (B, B)
+        clip_sims = torch.mean(max_sims, dim=2)
+
         return clip_sims, token_sims
 
-    def compute_contrastive_loss(self, clip_similarities, token_sims):
+    def compute_regularization_losses_av(self, token_sims):
         """
-        Standard cross-entropy contrastive loss across text->vision and vision->text,
-        plus regularization.
+        Based on the old AudioVisualModel, includes:
+          1. Non-negative pressure (we clamp negative sims in [-20, 0])
+          2. Temperature constraints (optional if you're using a trainable temperature)
         """
-        batch_size = clip_similarities.shape[0]
-        labels = torch.arange(batch_size).to(clip_similarities.device)
-        
-        log_prob_t2v = F.log_softmax(clip_similarities, dim=1)
-        losses_t2v = -log_prob_t2v[torch.arange(batch_size), labels]
-        
-        log_prob_v2t = F.log_softmax(clip_similarities.t(), dim=1)
-        losses_v2t = -log_prob_v2t[torch.arange(batch_size), labels]
-        
-        contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
-
-        # Add our regularization terms
-        reg_loss = self.compute_regularization_losses(clip_similarities, token_sims)
-        
-        total_loss = contrastive_loss + reg_loss
-        return total_loss, contrastive_loss, reg_loss
-    
-    def compute_regularization_losses(self, clip_sims, token_sims):
-        """
-        1) Force negative sims near zero (existing approach).
-        2) Patch usage sparsity: if a patch is used by > threshold fraction of tokens, penalize it.
-        """
-        # --- (1) Negative sims near zero ---
-        # We only penalize negative values in token_sims (any of them across the batch).
+        # 1) Non-negative pressure
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims ** 2)
+
+        # 2) Temperature calibration (if temperature is a Parameter)
+        #    force it between [1,4] or something.
+        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
+                               - torch.log(self.temperature), min=0) ** 4
+        temp_high = torch.clamp(torch.log(self.temperature) 
+                                - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 4
+        l_cal = temp_low + temp_high
+
+        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)
+        return reg_loss
+
+    def compute_contrastive_loss_av(self, clip_sims, token_sims):
+        """
+        InfoNCE-style cross-entropy for audio<->visual + regularizations.
+        """
+        B = clip_sims.shape[0]
+        labels = torch.arange(B, device=clip_sims.device)
+
+        log_prob_a2v = F.log_softmax(clip_sims, dim=1)
+        losses_a2v = -log_prob_a2v[torch.arange(B), labels]
+
+        log_prob_v2a = F.log_softmax(clip_sims.t(), dim=1)
+        losses_v2a = -log_prob_v2a[torch.arange(B), labels]
+
+        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+        reg_loss = self.compute_regularization_losses_av(token_sims)
+        return contrastive_loss + reg_loss
+
+    def forward_audio_visual(self, frames, audio):
+        """
+        audio: (B, T) raw waveform
+        frames: (B, 3, 224, 224)
         
-        # --- (2) Patch usage sparsity ---
-        # We'll compute soft usage for the "correct" pairs only (diagonal of token_sims).
-        # token_sims has shape (B, B, Nt, Nv).
+        If training: returns scalar loss
+        If eval: returns token_sims
+        """
+        # 1) Get embeddings
+        print(audio.shape)
+        visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
+        audio_feats = self.audio_embedder(audio)         # (B, Na, D)
+
+        # 2) If training, compute the cross-batch losses
+        if self.training:
+            clip_sims, token_sims = self.compute_all_similarities_av(audio_feats, visual_feats)
+            return self.compute_contrastive_loss_av(clip_sims, token_sims)
+        else:
+            # If not training, just return raw pairwise token-level similarities for each item
+            # shape => (B, Na, Nv)
+            token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
+            return token_sims
+
+    ######################################################
+    #               TEXT-VISUAL PATH
+    ######################################################
+    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
+        """
+        cross-batch approach: (text_i, visual_j)
+        text_feats:   (B, Nt, D)
+        visual_feats: (B, Nv, D)
+        attention_mask: (B, Nt)
+        
+        Returns:
+            clip_sims: (B, B)
+            token_sims: (B, B, Nt, Nv)
+        """
+        B = text_feats.shape[0]
+
+        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
+
+        # token-level similarity => (B, B, Nt, Nv)
+        token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature
+
+        # max over visual dimension => (B, B, Nt)
+        max_sims = torch.max(token_sims, dim=3)[0]
+
+        # we need masked mean over Nt
+        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
+        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
+        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
+        valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
+        clip_sims = masked_sum / valid_tokens
+
+        return clip_sims, token_sims
+
+    def compute_regularization_losses_tv(self, token_sims):
+        """
+        1) negative sims near zero
+        2) patch usage sparsity on positive pairs
+        """
+        # (B, B, Nt, Nv)
         B = token_sims.shape[0]
+
+        # 1) negative clamp
+        neg_sims = torch.clamp(token_sims, min=-20, max=0)
+        l_nonneg = torch.mean(neg_sims**2)
+
+        # 2) patch usage sparsity (for the diagonal pairs only)
         positive_sims = []
         for i in range(B):
-            # shape (Nt, Nv)
+            # shape (Nt, Nv) from token_sims[i, i]
             positive_sims.append(token_sims[i, i])
-        # Stack => (B, Nt, Nv)
-        positive_sims = torch.stack(positive_sims, dim=0)
+        if len(positive_sims) == 0:
+            # fallback
+            return 0.15 * l_nonneg
 
-        # Now take a softmax over the patches dimension => (B, Nt, Nv)
+        positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
+
+        # softmax over patches => (B, Nt, Nv)
         patch_probs = F.softmax(positive_sims, dim=-1)
 
-        # patch_fraction[b, v] = fraction of text tokens that (softly) pick patch v
-        # shape => (B, Nv)
+        # fraction usage per patch => sum over Nt, then / Nt => (B, Nv)
         patch_fraction = patch_probs.sum(dim=1) / patch_probs.shape[1]
 
-        # For each patch, if fraction > threshold, penalize (we do a ReLU).
-        # shape => (B, Nv)
-        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)
-
-        # We can do a squared penalty or linear. Example: squared:
+        # penalize if fraction > threshold
+        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)  # (B, Nv)
         loss_sparsity = (excess ** 2).mean()
 
-        # Weighted sum of negative sims penalty + patch usage penalty
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
         return reg_loss
-        
-    def forward(self, frames, texts):
+
+    def compute_contrastive_loss_tv(self, clip_sims, token_sims):
         """
-        Forward pass computing embeddings, similarities and loss
-        
-        Args:
-            frames: (B, C, H, W) batch of images
-            texts: List[str] batch of text inputs
-            
-        Returns:
-            If training: scalar contrastive loss
-            If eval: (B, Nt, Nv) raw token similarity matrix OR aggregated similarity
+        Standard cross-entropy for text<->visual plus the reg losses.
         """
-        # Get embeddings
-        visual_feats = self.visual_embedder(frames)             # (B, Nv, D)
-        text_feats, attention_mask = self.text_embedder(texts)  # (B, Nt, D), (B, Nt)
-        
+        B = clip_sims.shape[0]
+        labels = torch.arange(B, device=clip_sims.device)
+
+        # text->visual
+        log_prob_t2v = F.log_softmax(clip_sims, dim=1)
+        losses_t2v = -log_prob_t2v[torch.arange(B), labels]
+
+        # visual->text
+        log_prob_v2t = F.log_softmax(clip_sims.t(), dim=1)
+        losses_v2t = -log_prob_v2t[torch.arange(B), labels]
+
+        contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
+        reg_loss = self.compute_regularization_losses_tv(token_sims)
+
+        total_loss = contrastive_loss + reg_loss
+        return total_loss
+
+    def forward_text_visual(self, frames, text_list):
+        """
+        frames: (B, 3, 224, 224)
+        text_list: list of strings length B
+
+        If training: return scalar contrastive loss
+        else: return (sim_matrix, attention_mask)
+        """
+        visual_feats = self.visual_embedder(frames)               # (B, Nv, D)
+        text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
+
         if self.training:
-            # Compute cross-batch similarities and do standard contrastive
-            clip_sims, token_sims = self.compute_all_similarities(
-                text_feats, visual_feats, attention_mask
-            )
-            return self.compute_contrastive_loss(clip_sims, token_sims)
+            clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
+            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
         else:
-            # Inference path: compute pairwise sim for each item and do masked mean
-            sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats) # (B, Nt, Nv)
+            # for eval, return the raw token-level sim + mask
+            sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
             return sim_matrix, attention_mask
 
 
+#################################################################
+#                        Quick Test
+#################################################################
 if __name__ == "__main__":
-    # Example usage
-    model = TextVisualModel(
+    print("Testing MultiModalModel with random inputs...")
+
+    # Instantiate the unified model
+    model = MultiModalModel(
+        audio_model_name="facebook/hubert-base-ls960",
+        text_model_name="answerdotai/ModernBERT-base",
         temperature=2.0,
-        patch_sparsity_threshold=0.4,
-        patch_sparsity_weight=0.4,
+        patch_sparsity_threshold=0.3,
+        patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1
     )
-    
-    batch_size = 4
-    frames = torch.randn(batch_size, 3, 224, 224)
-    texts = ["a dog running", "cat sleeping", "bird flying", "fish swimming"]
-    
-    # Training mode
+
+    # Synthetic batch
+    batch_size = 2
+    dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
+    dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
+    dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
+
+    # 1) Audio-Visual training
     model.train()
-    loss = model(frames, texts)
-    print(f"Training loss: {loss.item()}")
-    
-    # Inference mode
+    av_loss = model.forward_audio_visual(dummy_frames, dummy_audio)
+    print(f"Audio-Visual loss: {av_loss.item():.4f}")
+
+    # 2) Text-Visual training
+    tv_loss = model.forward_text_visual(dummy_frames, dummy_texts)
+    print(f"Text-Visual loss: {tv_loss.item():.4f}")
+
+    # 3) Audio-Visual inference
     model.eval()
-    similarities, attention_mask = model(frames, texts)
-    print(f"Inference similarities shape: {similarities.shape}")
-    print(f"Similarity values: {similarities}")
+    with torch.no_grad():
+        av_sims = model.forward_audio_visual(dummy_frames, dummy_audio)
+        print(f"Audio-Visual similarities shape: {av_sims.shape}")  
+        # expected => (B, Na, Nv)
+
+        tv_sims, tv_mask = model.forward_text_visual(dummy_frames, dummy_texts)
+        print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
+        # expected => (B, Nt, Nv), (B, Nt)
+    
+    print("MultiModalModel test completed.")
