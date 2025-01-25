@@ -131,6 +131,112 @@ class AudioVisualizer:
 
         print(f"Saved attention video to {output_path}")
 
+    def plot_audio_token_attentions(
+        self,
+        model,
+        frame: torch.Tensor,
+        audio: torch.Tensor,
+        output_path: str = None,
+        num_tokens_to_show: int = 5
+    ):
+        """
+        Create multi-subplot figure showing attention overlays for a few audio tokens.
+        
+        Args:
+            model: The MultiModalModel (set to eval mode outside).
+            frame: (3, H, W) ImageNet normalized frame
+            audio: (T,) raw audio waveform or a snippet
+            output_path: Optional path to save figure (png)
+            num_tokens_to_show: how many audio tokens to visualize
+            
+        Behavior:
+            1) We compute token-level similarity => shape (Na, Nv).
+            2) We'll pick some indices from the audio token dimension (Na).
+            3) We'll upsample each patch map => overlay => subplot.
+        """
+        # Denormalize the frame
+        frame_np = frame.permute(1,2,0).cpu().numpy()
+        mean = np.array([0.485, 0.456, 0.406]).reshape(1,1,3)
+        std  = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
+        frame_np = (frame_np * std + mean) * 255
+        frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+
+        # Forward pass to get (Na, Nv) similarities
+        with torch.no_grad():
+            batch_frame = frame.unsqueeze(0).to(next(model.parameters()).device)   # (1,3,H,W)
+            batch_audio = audio.unsqueeze(0).to(next(model.parameters()).device)   # (1,T)
+            
+            visual_feats = model.visual_embedder(batch_frame)   # (1, Nv, D)
+            audio_feats  = model.audio_embedder(batch_audio)    # (1, Na, D)
+
+            # => (1, Na, Nv)
+            token_sims = model.compute_similarity_matrix(audio_feats, visual_feats)
+            token_sims = token_sims.squeeze(0)  # (Na, Nv)
+        
+        Na, Nv = token_sims.shape
+        if Na == 0:
+            print("No audio tokens found! Possibly zero-length audio input.")
+            return
+
+        # If the audio has fewer tokens than requested, clamp
+        num_tokens_to_show = min(num_tokens_to_show, Na)
+
+        # We'll pick linearly spaced indices, or random. Here let's do linear:
+        selected_indices = np.linspace(0, Na-1, num_tokens_to_show).astype(int)
+        # Convert the patch-level attention to heatmaps => (Na, H, W)
+        # Reuse same upsampling logic as `patches_to_heatmaps`
+        # We'll do the same approach as get_attention_maps => just break it out here:
+        patch_size = self.patch_size
+        patches = token_sims.reshape(Na, self.num_patches, self.num_patches)
+        patches = patches ** 2  # square for contrast
+        heatmaps = F.interpolate(
+            patches.unsqueeze(1),
+            size=(self.image_size, self.image_size),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)  # shape => (Na, 224, 224)
+
+        # Create subplots
+        rows = (num_tokens_to_show + 3) // 4
+        cols = min(4, num_tokens_to_show)
+        fig, axes = plt.subplots(rows, cols, figsize=(4.5*cols, 4.5*rows))
+        if rows == 1 and cols == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+
+        for i, token_idx in enumerate(selected_indices):
+            # overlay
+            attn_map = heatmaps[token_idx].cpu().numpy()
+            overlay = self.create_overlay_frame(frame_np, attn_map)
+            
+            ax = axes[i]
+            ax.imshow(overlay)
+            ax.set_title(f"Audio token {token_idx}")
+            ax.axis('off')
+
+        # Hide any unused subplots
+        for ax in axes[len(selected_indices):]:
+            ax.axis('off')
+
+        plt.tight_layout()
+        if output_path:
+            plt.savefig(output_path)
+            plt.close()
+            print(f"Saved audio attention snapshot to {output_path}")
+        else:
+            plt.show()
+
+    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.5):
+        """
+        (Same as in your existing code) Overlays a heatmap onto an RGB frame.
+        """
+        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        heatmap = np.power(heatmap, 2)
+        heatmap_colored = self.cmap(heatmap)[...,:3]  # shape (H, W, 3)
+        heatmap_bgr = (heatmap_colored * 255).astype(np.uint8)
+        overlay = ((1 - alpha) * frame_np + alpha * heatmap_bgr).astype(np.uint8)
+        return overlay
+
 
 #########################################################
 #                   TEXT VISUALIZER

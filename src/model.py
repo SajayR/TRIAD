@@ -301,7 +301,7 @@ class MultiModalModel(nn.Module):
         If eval: returns token_sims
         """
         # 1) Get embeddings
-        print(audio.shape)
+        #print(audio.shape)
         visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
         audio_feats = self.audio_embedder(audio)         # (B, Na, D)
 
