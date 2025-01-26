@@ -424,7 +424,26 @@ class MultiModalModel(nn.Module):
             # for eval, return the raw token-level sim + mask
             sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
             return sim_matrix, attention_mask
+        
+    #during simple forward, we just return the embeddings of the modalities provided
+    def forward(self, frames=None, audio=None, text_list=None):
+        assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"
+        embeddings = {}
+        if frames is not None:
+            embeddings['visual_feats'] = self.visual_embedder(frames)
+        if audio is not None:
+            embeddings['audio_feats'] = self.audio_embedder(audio)
+        if text_list is not None:
+            embeddings['text_feats'], _ = self.text_embedder(text_list)
 
+        # if two or more modalities are present, we compute the similarity matrix 
+        if frames is not None and text_list is not None:
+            embeddings['vis_text_sim_matrix'] = self.compute_similarity_matrix(embeddings['text_feats'], embeddings['visual_feats'])
+        if audio is not None and frames is not None:
+            embeddings['vis_audio_sim_matrix'] = self.compute_similarity_matrix(embeddings['audio_feats'], embeddings['visual_feats'])
+        if audio is not None and text_list is not None:
+            embeddings['text_audio_sim_matrix'] = self.compute_similarity_matrix(embeddings['text_feats'], embeddings['audio_feats'])
+        return embeddings
 
 #################################################################
 #                        Quick Test
