@@ -284,6 +284,7 @@ class TextVisualizer:
             # Convert to heatmaps
             attention_maps = self._patches_to_heatmaps(sim_matrix)
             tokens = model.text_embedder.tokenizer.tokenize(text)
+            tokens = [token.replace('Ġ', '') for token in tokens]
 
         return attention_maps, tokens[:valid_tokens_count]
 

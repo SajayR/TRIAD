@@ -565,11 +565,11 @@ if __name__ == "__main__":
         audio_visual_data_root="/home/cis/VGGSound_Splits", 
         text_dataset_path="/home/cis/heyo/DenseRead/livis",  # local HF dataset
         output_dir="./outputs_multimodal",
-        batch_size_av=24,
-        batch_size_tv=24,
+        batch_size_av=20,
+        batch_size_tv=20,
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=False,   # set True to use W&B
+        use_wandb=True,   # set True to use W&B
         force_new_training=True,
         vis_every=5000,
         save_every_steps=10000,
