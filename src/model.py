@@ -45,6 +45,8 @@ class AudioEmbedder(nn.Module):
         # Convert raw wave to the model's input format
         # NOTE: We do a batch at a time. If your collate function 
         #       produces shape [B, T], this is fine. 
+        if len(audio_input.shape) == 3:  # shape: [B, 1, T]
+            audio_input = audio_input.squeeze(0)  # squeeze first dim to get [B, T]
         inputs = self.processor(
             audio_input, 
             return_tensors="pt",
@@ -151,7 +153,9 @@ class ViTEmbedder(nn.Module):
             # If you want partial finetuning, remove the "no_grad" context:
             # but let's keep it minimal. 
             pass
-
+        #print(f"x shape: {x.shape}")
+        if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
+            x = x.squeeze(0)  # squeeze first dim to get [1, 3, 224, 224]
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
         # Project
         feats = self.projection(patches)

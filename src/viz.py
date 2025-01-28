@@ -91,45 +91,83 @@ class AudioVisualizer:
         overlay = ((1 - alpha) * frame_np + alpha * heatmap_bgr).astype(np.uint8)
         return overlay
 
-    def make_attention_video(self, model, frame, audio, output_path, fps=50):
+    def make_attention_video(self, model, frame, audio, output_path, video_path=None, fps=50):
         """
-        Generate an attention video for a single (frame, audio).
-        In the final MP4, each frame corresponds to one audio token's attention over the image.
-        Audio is optionally muxed in if you wish to do so (requires the original video or wave).
-        For minimal code, we won't do advanced A/V muxing from raw wave here unless you prefer.
+        Create attention visualization video - synchronized to 1s duration if your data is 1s.
+        
+        Args:
+            model: your MultiModalModel or equivalent
+            frame: ImageNet normalized frame tensor [C, H, W]  (or [1, C, H, W] if you prefer)
+            audio: normalized audio tensor [T] or [1, T]
+            output_path: path to save the final .mp4
+            video_path: optional path to a real .mp4 file to extract audio track from
+            fps: frames per second in the generated visualization video
+
+        Behavior:
+          1) For each audio token, we overlay the attention heatmap on the same frame → produce a single frame in the video.
+          2) We write a temporary .mp4 with no audio track.
+          3) If `video_path` is given, we use ffmpeg to mux the *original audio* from `video_path` into our new frames.
+             This replicates the logic you had in your original code.
         """
+        # If necessary, reshape so it's (1, C, H, W):
+        if frame.ndim == 3:
+            frame = frame.unsqueeze(0)
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+        
         self._validate_inputs(frame, audio)
+        
+        # Compute attention maps => shape (Na, H, W)
+        attention_maps = self.get_attention_maps(model, frame, audio)  # calls compute_similarity_matrix => upsample
+
         # Denormalize the image to [0..255]
-        frame_np = frame.permute(1, 2, 0).cpu().numpy()
+        frame_np = frame.squeeze(0).permute(1, 2, 0).cpu().numpy()
         mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
-        std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+        std  = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
         frame_np = (frame_np * std + mean) * 255
         frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
 
-        # Get attention maps => (Na, H, W)
-        attention_maps = self.get_attention_maps(model, frame, audio)
-
+        # Prepare output paths
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_video_path = str(output_path.with_suffix('.temp.mp4'))
 
+        # Write the frames (one per audio token) into a silent .mp4
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (self.image_size, self.image_size))
-
         for heatmap in attention_maps:
             # shape => (H, W)
             overlay = self.create_overlay_frame(frame_np, heatmap.cpu().numpy())
-            # Convert RGB to BGR for OpenCV
+            # Convert RGB->BGR for OpenCV
             overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
             writer.write(overlay_bgr)
-
         writer.release()
 
-        # Optional: if you want to add real audio from a wave or from some source,
-        # you'd need to do something like ffmpeg merging. Skipping it for brevity.
-        Path(temp_video_path).rename(output_path)
-
-        print(f"Saved attention video to {output_path}")
+        # If video_path is provided, mux the original audio track in using ffmpeg
+        if video_path is not None:
+            try:
+                audio_input = ffmpeg.input(str(video_path)).audio
+                video_input = ffmpeg.input(temp_video_path).video
+                stream = ffmpeg.output(
+                    video_input,
+                    audio_input,
+                    str(output_path),
+                    vcodec='copy',
+                    acodec='aac'
+                ).overwrite_output()
+                stream.run(capture_stdout=True, capture_stderr=True)
+                # Remove the temp file once we've merged them
+                Path(temp_video_path).unlink()
+                print(f"Saved attention video with original audio to {output_path}")
+            except ffmpeg.Error as e:
+                print("Error in ffmpeg muxing:", e.stderr.decode('utf8'))
+                print("Falling back to silent .mp4")
+                # if mux fails, just rename the temp
+                Path(temp_video_path).rename(output_path)
+        else:
+            # If no video_path, just rename the silent temp .mp4
+            Path(temp_video_path).rename(output_path)
+            print(f"Saved attention video (no audio) to {output_path}")
 
     def plot_audio_token_attentions(
         self,

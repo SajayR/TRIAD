@@ -243,7 +243,9 @@ if __name__ == "__main__":
     for batch_idx, (images, captions, short_captions) in enumerate(dataloader):
         print(f"\nBatch {batch_idx + 1}")
         print(f"Image batch shape: {images.shape}") # [batch_size, 3, 224, 224]
-        print(f"Sample caption: {captions[0][:100]}...") 
+        print(f"Caption batch shape: {captions.shape}") # [batch_size, 100]
+        print(f"Short caption batch shape: {short_captions.shape}") # [batch_size, 100]
+        print(f"Sample caption: {captions[0][:100]}...")
         print(f"Sample short caption: {short_captions[0][:100]}...")
         
         # Test just one batch

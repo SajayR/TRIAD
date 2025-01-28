@@ -235,7 +235,8 @@ class MultiModalTrainer:
                 wandb.init(project=self.project_name, config=self.config)
         elif self.use_wandb and force_new_training:
             wandb.init(project=self.project_name, config=self.config)
-        elif self.use_wandb and wandb.run is None:
+            
+        if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, config=self.config)
 
         # -----------------------------------------------------
@@ -291,14 +292,10 @@ class MultiModalTrainer:
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.best_loss = ck["best_loss"]
-        if "vis_samples_av" in ck:
-            self.vis_samples_av = ck["vis_samples_av"]
-        if "vis_samples_tv" in ck:
-            self.vis_samples_tv = ck["vis_samples_tv"]
 
-        if self.use_wandb:
+        #if self.use_wandb:
             # Optionally resume W&B run if run ID was stored
-            wandb.config.update(self.config, allow_val_change=True)
+            #wandb.config.update(self.config, allow_val_change=True)
 
         self._adjust_lr_for_frozen_params(self.start_epoch)
         self.logger.info(f"Checkpoint loaded (epoch={self.start_epoch}, step={self.global_step})")
@@ -308,17 +305,21 @@ class MultiModalTrainer:
     ###########################################
     def _get_av_vis_samples(self, n_samples=2):
         """
-        Pull a small batch from the av_dataloader for visualization. 
-        We'll store them on CPU, so we convert them to CPU now.
+        Pull a small batch from av_dataloader.
+        Return frames, audio, *and* video_paths so we can pass them to the visualizer.
         """
         batch = next(iter(self.av_dataloader))
-        # If the batch is smaller than n_samples, just take all
         idxs = range(min(n_samples, len(batch['frame'])))
+
         frames = batch['frame'][list(idxs)]
-        audio = batch['audio'][list(idxs)]
+        audio  = batch['audio'][list(idxs)]
+        # new: gather the actual video_paths from the batch
+        video_paths = [batch['video_paths'][j] for j in idxs]
+
         return {
             "frames": frames.cpu(),
-            "audio": audio.cpu()
+            "audio": audio.cpu(),
+            "video_paths": video_paths
         }
 
     def _get_tv_vis_samples(self, n_samples=2):
@@ -501,52 +502,70 @@ class MultiModalTrainer:
     #        Visualization logic
     ###########################################
     def visualize_samples(self, epoch):
+        """
+        We'll create a snapshot image plus the .mp4 with the original audio track (if present).
+        """
         self.model.eval()
 
-        # --- A) AUDIO-VISUAL ---
+        # -----------------------------------------------
+        # A) Audio-Visual
+        # -----------------------------------------------
         with torch.no_grad():
             for i in range(len(self.vis_samples_av["frames"])):
                 frame = self.vis_samples_av["frames"][i].to(self.device)
                 audio = self.vis_samples_av["audio"][i].to(self.device)
+                video_path = self.vis_samples_av["video_paths"][i]  # local mp4 for muxing
 
-                out_file = self.output_dir / f"av_snapshot_epoch{epoch}_sample{i}.png"
-                
-                # Instead of make_attention_video, call the new snapshot method:
+                # 1) Snapshots for W&B
+                out_file_img = self.output_dir / f"av_snapshot_epoch{epoch}_sample{i}.png"
                 aviz = AudioVisualizer()
                 aviz.plot_audio_token_attentions(
                     model=self.model,
                     frame=frame,
                     audio=audio,
-                    output_path=str(out_file),
-                    num_tokens_to_show=5  # or however many you want
+                    output_path=str(out_file_img),
+                    num_tokens_to_show=5
                 )
-                
-                # If using W&B:
+
+                # 2) Local .mp4 creation with optional audio mux
+                out_file_vid = self.output_dir / f"av_viz_epoch{epoch}_sample{i}.mp4"
+                aviz.make_attention_video(
+                    model=self.model,
+                    frame=frame,
+                    audio=audio,
+                    output_path=out_file_vid,
+                    video_path=video_path,  # Here we pass the real .mp4 for audio mux
+                    fps=50
+                )
+
+                # 3) Log the snapshot image to W&B
                 if self.use_wandb:
                     wandb.log({
-                        f"av_attention_sample_{i}": wandb.Image(str(out_file)),
+                        f"av_attention_sample_{i}": wandb.Image(str(out_file_img)),
                         "epoch": epoch,
                         "global_step": self.global_step
                     })
 
-        # --- B) TEXT-VISUAL ---
+        # -----------------------------------------------
+        # B) Text-Visual
+        # -----------------------------------------------
         with torch.no_grad():
             for i in range(len(self.vis_samples_tv["images"])):
                 frame = self.vis_samples_tv["images"][i].to(self.device)
                 text = self.vis_samples_tv["texts"][i]
 
-                out_file = self.output_dir / f"tv_viz_epoch{epoch}_sample{i}.png"
+                out_file_img = self.output_dir / f"tv_viz_epoch{epoch}_sample{i}.png"
                 tviz = TextVisualizer()
                 tviz.plot_token_attentions(
                     model=self.model,
                     frame=frame,
                     text=text,
-                    output_path=out_file
+                    output_path=str(out_file_img)
                 )
 
                 if self.use_wandb:
                     wandb.log({
-                        f"tv_attention_sample_{i}": wandb.Image(str(out_file), caption=text),
+                        f"tv_attention_sample_{i}": wandb.Image(str(out_file_img), caption=text),
                         "epoch": epoch,
                         "global_step": self.global_step
                     })
@@ -554,6 +573,7 @@ class MultiModalTrainer:
         self.model.train()
         plt.close('all')
         gc.collect()
+
 
 
 ###########################################
@@ -570,7 +590,7 @@ if __name__ == "__main__":
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,   # set True to use W&B
-        force_new_training=True,
+        force_new_training=False,
         vis_every=5000,
         save_every_steps=10000,
         num_workers=8,
@@ -580,8 +600,8 @@ if __name__ == "__main__":
         unfreeze_text_epoch=1,
         unfreeze_vit_epoch=1,
         project_name="Triad",
-        num_vis_samples_av=10,
-        num_vis_samples_tv=10,
+        num_vis_samples_av=15,
+        num_vis_samples_tv=15,
     )
 
     trainer.train()
