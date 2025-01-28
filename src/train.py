@@ -13,7 +13,6 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
-# Import your existing modules
 from dataset import (
     AudioVisualDataset, VideoBatchSampler, collate_fn,
     LivisDataset
@@ -36,8 +35,6 @@ def collate_text_fn(batch):
     """
     images, captions, short_captions = zip(*batch)
     images = torch.stack(images)  # shape => (B, 3, 224, 224)
-    # We can choose to use short_captions or the full captions
-    # For demonstration, let's just use short_captions
     return {
         'images': images,
         'captions': list(short_captions)  # or list(captions)
@@ -55,21 +52,17 @@ class MultiModalTrainer:
 
     def __init__(
         self,
-        # Data / model paths
         audio_visual_data_root: str,
-        text_dataset_path: str,  # path to local HF dataset
+        text_dataset_path: str, 
         output_dir: str = "./outputs_multimodal",
-        # Training hyperparams
         batch_size_av: int = 16,
         batch_size_tv: int = 32,
         num_epochs: int = 20,
         learning_rate: float = 1e-4,
         gradient_accumulation_steps: int = 1,
-        # Freezing schedule (optional)
         unfreeze_audio_epoch: int = 3,
         unfreeze_text_epoch: int = 5,
         unfreeze_vit_epoch: int = 8,
-        # Logging / checkpoint
         use_wandb: bool = True,
         project_name: str = "UnifiedMultiModal",
         vis_every: int = 1000,
@@ -141,10 +134,8 @@ class MultiModalTrainer:
             prefetch_factor=8
         )
 
-        # b) TextVisual dataset
         import datasets
         hf_dset = datasets.load_dataset(text_dataset_path)
-        # We'll default to 'train' split
         self.tv_dataset = LivisDataset(hf_dset, split='train')
         self.tv_dataloader = DataLoader(
             self.tv_dataset,
@@ -157,7 +148,6 @@ class MultiModalTrainer:
             prefetch_factor=8
         )
 
-        # Convert them to iterators so we can step them in sync
         self.av_iter = None
         self.tv_iter = None
 
@@ -192,18 +182,12 @@ class MultiModalTrainer:
                 vit_params.append(param)
             else:
                 others_params.append(param)
-
-        # Start with only the "others" group having full LR
-        # For the large backbones, we might start them at near 0, unfreezing them later
         self.optimizer = torch.optim.AdamW([
             {"params": others_params, "lr": learning_rate},
             {"params": audio_params, "lr": 0.0},  # freeze at start
             {"params": text_params, "lr": 0.0},   # freeze at start
             {"params": vit_params, "lr": 0.0},    # freeze at start
         ])
-
-        # We'll do a OneCycle for the final LR on each group, but we won't start them
-        # until unfreeze. For simplicity, you can keep a single scheduler for now:
         total_steps_per_epoch = max(len(self.av_dataloader), len(self.tv_dataloader))
         self.steps_per_epoch = total_steps_per_epoch
         self.total_updates = self.steps_per_epoch * num_epochs // self.gradient_accumulation_steps
@@ -225,9 +209,7 @@ class MultiModalTrainer:
         self.global_step = 0  # counts batches
         self.best_loss = float('inf')
 
-        # Prepare W&B
         if self.use_wandb and not force_new_training:
-            # Attempt to load checkpoint if exists
             ckpt = self.find_latest_checkpoint()
             if ckpt:
                 self.load_checkpoint(ckpt)
@@ -238,18 +220,10 @@ class MultiModalTrainer:
             
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, config=self.config)
-
-        # -----------------------------------------------------
-        #  5) Visualization setup
-        # -----------------------------------------------------
         self.audio_viz = AudioVisualizer()
         self.text_viz = TextVisualizer()
-
-        # We'll store "vis_samples_av" and "vis_samples_tv" for separate tasks
         self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av)
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv)
-
-        # Logging initial info
         self.logger.info("Initialized MultiModalTrainer")
 
     ###########################################
@@ -277,7 +251,7 @@ class MultiModalTrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_loss": self.best_loss,
             "config": self.config,
-            "vis_samples_av": self.vis_samples_av,  # keep them on CPU
+            "vis_samples_av": self.vis_samples_av,
             "vis_samples_tv": self.vis_samples_tv,
         }
         torch.save(ckpt, ckpt_path)
@@ -292,11 +266,6 @@ class MultiModalTrainer:
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.best_loss = ck["best_loss"]
-
-        #if self.use_wandb:
-            # Optionally resume W&B run if run ID was stored
-            #wandb.config.update(self.config, allow_val_change=True)
-
         self._adjust_lr_for_frozen_params(self.start_epoch)
         self.logger.info(f"Checkpoint loaded (epoch={self.start_epoch}, step={self.global_step})")
 
@@ -389,22 +358,13 @@ class MultiModalTrainer:
         for epoch in range(self.start_epoch, total_epochs):
             self._adjust_lr_for_frozen_params(epoch)
             self.logger.info(f"Epoch {epoch} starting")
-
-            # Rebuild iterators each epoch
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
-
-            # We'll pick the max # of iterations to be the max of the two
             max_steps = max(len(self.av_dataloader), len(self.tv_dataloader))
-
-            # Storage for epoch losses
             epoch_losses = []
-            import time
 
             pbar = tqdm(range(max_steps), desc=f"Epoch {epoch}")
             for _ in pbar:
-                # 1) Get a batch from AV data
-                #start_time = time.time()
                 try:
                     av_batch = next(self.av_iter)
                 except StopIteration:
@@ -413,8 +373,6 @@ class MultiModalTrainer:
 
                 frames_av = av_batch['frame'].to(self.device)
                 audio = av_batch['audio'].to(self.device)
-
-                # 2) Get a batch from TV data
                 try:
                     tv_batch = next(self.tv_iter)
                 except StopIteration:
@@ -423,26 +381,13 @@ class MultiModalTrainer:
 
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv = tv_batch['captions']
-                #retrieval_time = time.time() - start_time
-                #print(f"Retrieval time: {retrieval_time:.2f} seconds")
-                #retrieval_time = time.time()
-                # 3) Forward pass for both tasks => sum
                 self.model.train()
                 loss_av = self.model.forward_audio_visual(frames_av, audio)
                 loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
                 loss_total = loss_av + loss_tv
-                #forward_time = time.time() - retrieval_time
-                #print(f"Forward time: {forward_time:.2f} seconds")
-                #forward_time = time.time()
-                # Accumulate
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
-                #backward_time = time.time() - forward_time
-                #print(f"Backward time: {backward_time:.2f} seconds")
-                #backward_time = time.time()
                 accumulation_counter += 1
-
-                # Step after enough accumulation
                 if accumulation_counter % self.gradient_accumulation_steps == 0:
                     clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
@@ -452,8 +397,6 @@ class MultiModalTrainer:
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
                 pbar.set_postfix({"loss": f"{loss_val:.4f}"})
-
-                # 4) Logging
                 if self.use_wandb:
                     wandb_dict = {
                         "train_loss": loss_val,
@@ -462,7 +405,6 @@ class MultiModalTrainer:
                         "epoch": epoch,
                         "global_step": self.global_step,
                     }
-                    # Optionally log the current LR for each param group
                     for i, pg in enumerate(self.optimizer.param_groups):
                         wandb_dict[f"lr_group{i}"] = pg["lr"]
                     wandb.log(wandb_dict)
@@ -472,31 +414,17 @@ class MultiModalTrainer:
                 del frames_av, audio, frames_tv, texts_tv, loss_total
                 torch.cuda.empty_cache()
 
-                # Periodic housekeeping
+                # housekeeping lol
                 if self.global_step % 500 == 0:
                     gc.collect()
-
-                # 5) Visualization
                 if self.global_step % self.vis_every == 0:
                     self.visualize_samples(epoch)
-
-                # 6) Checkpoint
                 if self.global_step % self.save_every_steps == 0:
                     self.save_checkpoint(epoch, self.global_step)
 
-                #end_time = time.time()
-                #print(f"Time for step {self.global_step}: {end_time - start_time:.2f} seconds")
-                
-
-            # End epoch
             epoch_loss = np.mean(epoch_losses)
             self.logger.info(f"Epoch {epoch} completed. Average loss={epoch_loss:.4f}")
-
-            # Save after each epoch
             self.save_checkpoint(epoch, self.global_step)
-
-        print("Training complete!")
-        self.logger.info("Training complete!")
 
     ###########################################
     #        Visualization logic
@@ -516,7 +444,7 @@ class MultiModalTrainer:
                 audio = self.vis_samples_av["audio"][i].to(self.device)
                 video_path = self.vis_samples_av["video_paths"][i]  # local mp4 for muxing
 
-                # 1) Snapshots for W&B
+    
                 out_file_img = self.output_dir / f"av_snapshot_epoch{epoch}_sample{i}.png"
                 aviz = AudioVisualizer()
                 aviz.plot_audio_token_attentions(
@@ -526,19 +454,15 @@ class MultiModalTrainer:
                     output_path=str(out_file_img),
                     num_tokens_to_show=5
                 )
-
-                # 2) Local .mp4 creation with optional audio mux
                 out_file_vid = self.output_dir / f"av_viz_epoch{epoch}_sample{i}.mp4"
                 aviz.make_attention_video(
                     model=self.model,
                     frame=frame,
                     audio=audio,
                     output_path=out_file_vid,
-                    video_path=video_path,  # Here we pass the real .mp4 for audio mux
+                    video_path=video_path, 
                     fps=50
                 )
-
-                # 3) Log the snapshot image to W&B
                 if self.use_wandb:
                     wandb.log({
                         f"av_attention_sample_{i}": wandb.Image(str(out_file_img)),
@@ -583,13 +507,13 @@ if __name__ == "__main__":
 
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/VGGSound_Splits", 
-        text_dataset_path="/home/cis/heyo/DenseRead/livis",  # local HF dataset
+        text_dataset_path="/home/cis/heyo/DenseRead/livis",  
         output_dir="./outputs_multimodal",
         batch_size_av=20,
         batch_size_tv=20,
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=True,   # set True to use W&B
+        use_wandb=True,  
         force_new_training=False,
         vis_every=5000,
         save_every_steps=10000,

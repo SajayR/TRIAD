@@ -17,7 +17,6 @@ from typing import Dict, List
 
 warnings.filterwarnings("ignore")
 
-# use fork for potentially faster dataloader start
 try:
     multiprocessing.set_start_method('fork', force=True)
 except:
@@ -45,7 +44,6 @@ class LivisDataset(Dataset):
         
     def _get_local_path(self, url):
         """Convert URL to local file path"""
-        # Extract ID and split from URL
         path = urlparse(url).path
         img_id = os.path.splitext(os.path.basename(path))[0]
         split = "val" if "val2017" in path else "train" if "train2017" in path else "unknown"
@@ -58,19 +56,14 @@ class LivisDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         img_path = self._get_local_path(item['url'])
-        
-        # Check if image exists locally
         if not img_path.exists():
             raise FileNotFoundError(f"Image {img_path} not found! Make sure to download images first.")
-            
-        # Load and transform image
         try:
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
         except Exception as e:
             print(f"Error loading image {img_path}: {str(e)}")
-            # Return a dummy tensor and empty captions if image loading fails
             return torch.zeros((3, 224, 224)), "", ""
             
         return image, item['caption'], item['short_caption']
@@ -228,17 +221,9 @@ def collate_fn(batch):
 
 if __name__ == "__main__":
     print("Testing LivisDataset...")
-    
-    # Load dataset
     dset = datasets.load_dataset("/home/cis/heyo/DenseRead/livis")
-    
-    # Create dataset instance
     dataset = LivisDataset(dset)
-    
-    # Create dataloader
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
-    
-    # Test a batch
     print("\nTesting batch loading...")
     for batch_idx, (images, captions, short_captions) in enumerate(dataloader):
         print(f"\nBatch {batch_idx + 1}")
@@ -247,8 +232,6 @@ if __name__ == "__main__":
         print(f"Short caption batch shape: {short_captions.shape}") # [batch_size, 100]
         print(f"Sample caption: {captions[0][:100]}...")
         print(f"Sample short caption: {short_captions[0][:100]}...")
-        
-        # Test just one batch
         break
 
     print("Testing AudioVisualDataset...")

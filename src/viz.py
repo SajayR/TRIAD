@@ -7,7 +7,7 @@ import cv2
 from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
-import ffmpeg  # Ensure ffmpeg-python is installed for audio+video output
+import ffmpeg 
 
 
 #########################################################
@@ -66,9 +66,7 @@ class AudioVisualizer:
         """Upsample patch-level attention (Na, Nv) into pixel-level heatmaps (Na, H, W)."""
         Na, Nv = patch_attention.shape
         patches = patch_attention.reshape(Na, self.num_patches, self.num_patches)
-        # Square the attention for better contrast
         patches = patches ** 2
-
         # Upsample to 224x224
         heatmaps = F.interpolate(
             patches.unsqueeze(1),
@@ -81,7 +79,6 @@ class AudioVisualizer:
 
     def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.5):
         """Overlay a heatmap onto an RGB frame."""
-        # Normalize the heatmap to [0,1]
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
 
@@ -126,24 +123,17 @@ class AudioVisualizer:
         std  = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
         frame_np = (frame_np * std + mean) * 255
         frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
-
-        # Prepare output paths
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_video_path = str(output_path.with_suffix('.temp.mp4'))
-
-        # Write the frames (one per audio token) into a silent .mp4
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (self.image_size, self.image_size))
         for heatmap in attention_maps:
             # shape => (H, W)
             overlay = self.create_overlay_frame(frame_np, heatmap.cpu().numpy())
-            # Convert RGB->BGR for OpenCV
             overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
             writer.write(overlay_bgr)
         writer.release()
-
-        # If video_path is provided, mux the original audio track in using ffmpeg
         if video_path is not None:
             try:
                 audio_input = ffmpeg.input(str(video_path)).audio
@@ -156,16 +146,13 @@ class AudioVisualizer:
                     acodec='aac'
                 ).overwrite_output()
                 stream.run(capture_stdout=True, capture_stderr=True)
-                # Remove the temp file once we've merged them
                 Path(temp_video_path).unlink()
                 print(f"Saved attention video with original audio to {output_path}")
             except ffmpeg.Error as e:
                 print("Error in ffmpeg muxing:", e.stderr.decode('utf8'))
                 print("Falling back to silent .mp4")
-                # if mux fails, just rename the temp
                 Path(temp_video_path).rename(output_path)
         else:
-            # If no video_path, just rename the silent temp .mp4
             Path(temp_video_path).rename(output_path)
             print(f"Saved attention video (no audio) to {output_path}")
 
@@ -198,8 +185,6 @@ class AudioVisualizer:
         std  = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
         frame_np = (frame_np * std + mean) * 255
         frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
-
-        # Forward pass to get (Na, Nv) similarities
         with torch.no_grad():
             batch_frame = frame.unsqueeze(0).to(next(model.parameters()).device)   # (1,3,H,W)
             batch_audio = audio.unsqueeze(0).to(next(model.parameters()).device)   # (1,T)
@@ -218,12 +203,7 @@ class AudioVisualizer:
 
         # If the audio has fewer tokens than requested, clamp
         num_tokens_to_show = min(num_tokens_to_show, Na)
-
-        # We'll pick linearly spaced indices, or random. Here let's do linear:
         selected_indices = np.linspace(0, Na-1, num_tokens_to_show).astype(int)
-        # Convert the patch-level attention to heatmaps => (Na, H, W)
-        # Reuse same upsampling logic as `patches_to_heatmaps`
-        # We'll do the same approach as get_attention_maps => just break it out here:
         patch_size = self.patch_size
         patches = token_sims.reshape(Na, self.num_patches, self.num_patches)
         patches = patches ** 2  # square for contrast
@@ -233,8 +213,6 @@ class AudioVisualizer:
             mode='bilinear',
             align_corners=False
         ).squeeze(1)  # shape => (Na, 224, 224)
-
-        # Create subplots
         rows = (num_tokens_to_show + 3) // 4
         cols = min(4, num_tokens_to_show)
         fig, axes = plt.subplots(rows, cols, figsize=(4.5*cols, 4.5*rows))
@@ -314,12 +292,9 @@ class TextVisualizer:
 
             sim_matrix = model.compute_similarity_matrix(text_feats, visual_feats)  # (1, Nt, Nv)
             sim_matrix = sim_matrix.squeeze(0)  # (Nt, Nv)
-            valid_tokens_count = text_mask.sum().item()  # how many tokens are real (non-padding)
-
-            # We'll only keep the valid rows from sim_matrix => shape (valid_tokens_count, Nv)
+            valid_tokens_count = text_mask.sum().item()  
             sim_matrix = sim_matrix[:valid_tokens_count]
 
-            # Convert to heatmaps
             attention_maps = self._patches_to_heatmaps(sim_matrix)
             tokens = model.text_embedder.tokenizer.tokenize(text)
             tokens = [token.replace('Ġ', '') for token in tokens]

@@ -42,9 +42,6 @@ class AudioEmbedder(nn.Module):
                 Na = number of audio tokens (T/320 for Hubert)
                 D = embedding_dim
         """
-        # Convert raw wave to the model's input format
-        # NOTE: We do a batch at a time. If your collate function 
-        #       produces shape [B, T], this is fine. 
         if len(audio_input.shape) == 3:  # shape: [B, 1, T]
             audio_input = audio_input.squeeze(0)  # squeeze first dim to get [B, T]
         inputs = self.processor(
@@ -54,14 +51,11 @@ class AudioEmbedder(nn.Module):
             padding=True,
             return_attention_mask=True
         ).input_values.squeeze(0)
-        # Move everything to the same device as self
         device = next(self.parameters()).device
         inputs = inputs.to(device)
         
-        # Forward pass of HuBERT
         hubert_output = self.hubert(inputs).last_hidden_state  # (B, T', hidden_size)
         
-        # Project to the desired dimension
         audio_feats = self.projection(hubert_output)  # (B, T', D)
         
         return audio_feats
@@ -107,7 +101,7 @@ class TextEmbedder(nn.Module):
         for k in inputs:
             inputs[k] = inputs[k].to(device)
 
-        outputs = self.encoder(**inputs)  # last_hidden_state shape: (B, Nt, hidden_size)
+        outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
         hidden_states = outputs.last_hidden_state
         text_feats = self.projection(hidden_states)  # (B, Nt, D)
         
@@ -125,14 +119,8 @@ class ViTEmbedder(nn.Module):
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vits14',
                  embedding_dim=512, dropout_prob=0.1):
         super().__init__()
-        # For minimal editing, we can load from torch.hub:
-        #   "facebookresearch/dinov2", "dinov2_vits14"
         self.model = torch.hub.load(model_name, arch)
-        
-        # Projection down to a 512-dim space (or your chosen dimension).
         self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
-        
-        # Optional dropout if desired
         self.dropout = nn.Dropout(p=dropout_prob)
 
         for param in self.model.parameters():
@@ -147,19 +135,11 @@ class ViTEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        # Example from DINOv2, we can get just the last layer
-        # 'get_intermediate_layers(x, n=1)[0]' returns patch embeddings shape (B, Nv, embed_dim).
-        with torch.no_grad():
-            # If you want partial finetuning, remove the "no_grad" context:
-            # but let's keep it minimal. 
-            pass
         #print(f"x shape: {x.shape}")
         if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
-            x = x.squeeze(0)  # squeeze first dim to get [1, 3, 224, 224]
+            x = x.squeeze(0)  # get [1, 3, 224, 224]
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
-        # Project
         feats = self.projection(patches)
-        # Optionally dropout
         feats = self.dropout(feats)
         
         return feats
@@ -169,20 +149,6 @@ class ViTEmbedder(nn.Module):
 #                   Unified MultiModalModel
 #################################################################
 class MultiModalModel(nn.Module):
-    """
-    A unified model that contains:
-      - audio_embedder (HuBERT)
-      - text_embedder  (BERT-like)
-      - visual_embedder (DINOv2 or ViT)
-    We provide two main forward routines:
-      - forward_audio_visual(...)
-      - forward_text_visual(...)
-    Each returns either a contrastive loss if self.training == True,
-    or returns raw similarity matrices if self.training == False.
-
-    We do minimal changes from the original AudioVisualModel & TextVisualModel
-    to keep the code logic close to the proven methods.
-    """
     def __init__(
         self, 
         audio_model_name="facebook/hubert-base-ls960",
@@ -194,19 +160,13 @@ class MultiModalModel(nn.Module):
     ):
         super().__init__()
 
-        # Encoders
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTEmbedder(arch='dinov2_vits14',
                                            embedding_dim=512,
                                            dropout_prob=visual_dropout_prob)
 
-        # If you want a trainable temperature, do:
-        #   self.temperature = nn.Parameter(torch.tensor(temperature))
-        # Or if you want a fixed scalar, store it as a float:
         self.temperature = nn.Parameter(torch.tensor(temperature))
-
-        # Additional hyperparams for text-visual reg
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
 
@@ -220,7 +180,6 @@ class MultiModalModel(nn.Module):
         feats2: (B, N2, D)
         Returns sim: (B, N1, N2)
         """
-        # Optionally normalize here:
         # feats1 = F.normalize(feats1, dim=-1)
         # feats2 = F.normalize(feats2, dim=-1)
         sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -248,12 +207,10 @@ class MultiModalModel(nn.Module):
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
 
         # dot product => (B, B, Na, Nv)
-        # Optionally normalize before dot
         token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
-
-        # Max over visual dimension => (B, B, Na)
+        # max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
-        # Then mean over audio dimension => (B, B)
+        # mean over audio dimension => (B, B)
         clip_sims = torch.mean(max_sims, dim=2)
 
         return clip_sims, token_sims
@@ -268,8 +225,8 @@ class MultiModalModel(nn.Module):
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims ** 2)
 
-        # 2) Temperature calibration (if temperature is a Parameter)
-        #    force it between [1,4] or something.
+        # 2) Temperature calibration
+        #    force it between [1,4] or sumn man idk.
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(self.temperature), min=0) ** 4
         temp_high = torch.clamp(torch.log(self.temperature) 
@@ -304,17 +261,13 @@ class MultiModalModel(nn.Module):
         If training: returns scalar loss
         If eval: returns token_sims
         """
-        # 1) Get embeddings
         #print(audio.shape)
         visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
         audio_feats = self.audio_embedder(audio)         # (B, Na, D)
-
-        # 2) If training, compute the cross-batch losses
         if self.training:
             clip_sims, token_sims = self.compute_all_similarities_av(audio_feats, visual_feats)
             return self.compute_contrastive_loss_av(clip_sims, token_sims)
         else:
-            # If not training, just return raw pairwise token-level similarities for each item
             # shape => (B, Na, Nv)
             token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
             return token_sims
@@ -360,7 +313,6 @@ class MultiModalModel(nn.Module):
         """
         # (B, B, Nt, Nv)
         B = token_sims.shape[0]
-
         # 1) negative clamp
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims**2)
@@ -371,7 +323,6 @@ class MultiModalModel(nn.Module):
             # shape (Nt, Nv) from token_sims[i, i]
             positive_sims.append(token_sims[i, i])
         if len(positive_sims) == 0:
-            # fallback
             return 0.15 * l_nonneg
 
         positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
@@ -425,7 +376,6 @@ class MultiModalModel(nn.Module):
             clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
             return self.compute_contrastive_loss_tv(clip_sims, token_sims)
         else:
-            # for eval, return the raw token-level sim + mask
             sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
             return sim_matrix, attention_mask
         
@@ -454,8 +404,6 @@ class MultiModalModel(nn.Module):
 #################################################################
 if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
-
-    # Instantiate the unified model
     model = MultiModalModel(
         audio_model_name="facebook/hubert-base-ls960",
         text_model_name="answerdotai/ModernBERT-base",
@@ -464,29 +412,20 @@ if __name__ == "__main__":
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1
     )
-
-    # Synthetic batch
     batch_size = 2
     dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
     dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
     dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
-
-    # 1) Audio-Visual training
     model.train()
     av_loss = model.forward_audio_visual(dummy_frames, dummy_audio)
     print(f"Audio-Visual loss: {av_loss.item():.4f}")
-
-    # 2) Text-Visual training
     tv_loss = model.forward_text_visual(dummy_frames, dummy_texts)
     print(f"Text-Visual loss: {tv_loss.item():.4f}")
-
-    # 3) Audio-Visual inference
     model.eval()
     with torch.no_grad():
         av_sims = model.forward_audio_visual(dummy_frames, dummy_audio)
         print(f"Audio-Visual similarities shape: {av_sims.shape}")  
         # expected => (B, Na, Nv)
-
         tv_sims, tv_mask = model.forward_text_visual(dummy_frames, dummy_texts)
         print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
         # expected => (B, Nt, Nv), (B, Nt)
