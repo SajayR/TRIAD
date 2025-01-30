@@ -25,52 +25,46 @@ import gc
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
 
-class LivisDataset(Dataset):
-    def __init__(self, hf_dataset, split='train', transform=None):
-        """
-        Args:
-            hf_dataset: HuggingFace dataset
-            split: Split to use (only 'train' for now)
-            transform: Optional transform to be applied on images
-        """
-        self.data = hf_dataset[split]
+class LocalCaptionDataset(Dataset):
+    def __init__(self, root_dir, split='train', transform=None):
+        self.root_dir = Path(root_dir)
         self.transform = transform or transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                               std=[0.229, 0.224, 0.225])
         ])
-        self.img_dir = Path("/home/cis/heyo/DenseRead/images")
         
-    def _get_local_path(self, url):
-        """Convert URL to local file path"""
-        path = urlparse(url).path
-        img_id = os.path.splitext(os.path.basename(path))[0]
-        split = "val" if "val2017" in path else "train" if "train2017" in path else "unknown"
-        
-        return self.img_dir / f"{split}_{img_id}.jpg"
+        # Get all image files recursively
+        self.image_files = list(self.root_dir.rglob("*.jpg"))
         
     def __len__(self):
-        return len(self.data)
+        return len(self.image_files)
     
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_path = self._get_local_path(item['url'])
-        if not img_path.exists():
-            raise FileNotFoundError(f"Image {img_path} not found! Make sure to download images first.")
+        img_path = self.image_files[idx]
+        txt_path = img_path.with_suffix('.txt')
+        
         try:
+            # Load and process image
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
-        except Exception as e:
-            print(f"Error loading image {img_path}: {str(e)}")
-            return torch.zeros((3, 224, 224)), "", ""
+                
+            # Load caption
+            with open(txt_path, 'r') as f:
+                caption = f.read().strip()
+                
+            return image, caption
             
-        return image, item['caption'], item['short_caption']
+        except Exception as e:
+            print(f"Error loading {img_path}: {str(e)}")
+            return torch.zeros((3, 224, 224)), ""
 
 
 def extract_audio_from_video(video_path: Path) -> torch.Tensor:
     """Extract entire 1s audio from video."""
+    container = None
     try:
         container = av.open(str(video_path))
         audio = container.streams.audio[0]
@@ -79,21 +73,24 @@ def extract_audio_from_video(video_path: Path) -> torch.Tensor:
         samples = []
         for frame in container.decode(audio):
             frame.pts = None
-            frame = resampler.resample(frame)[0]
-            samples.append(frame.to_ndarray().reshape(-1))
-        container.close()
+            resampled = resampler.resample(frame)
+            if resampled:  # Safety check
+                frame = resampled[0]
+                samples.append(frame.to_ndarray().reshape(-1))
+
+        if not samples:  # Another safety check if we got no samples
+            return torch.zeros(16331)
 
         samples = torch.tensor(np.concatenate(samples))
         samples = samples.float() / 32768.0  
         return samples
-    except:
-        print(f"Failed to load audio from {video_path}")
+    except Exception as e:
+        print(f"Failed to load audio from {video_path}: {str(e)}")
         return torch.zeros(16331)
     finally:
         if container:
             container.close()
-        #gc.collect()
-        #torch.cuda.empty_cache()
+
 
 def load_and_preprocess_video(video_path: str, sample_fps: int) -> torch.Tensor:
     """Load only one random frame from the 1s video using PyAV, resize, and normalize."""
@@ -164,43 +161,54 @@ class AudioVisualDataset(Dataset):
     def __init__(self, data_root: str, sample_fps: int = 20):
         self.data_root = Path(data_root)
         self.sample_fps = sample_fps
-        self.video_files = sorted(list(self.data_root.glob("*.mp4")))
         
-        self.vid_to_files = {}
-        for file in self.video_files:
-            vid_num = int(file.stem.split('_')[0])
-            if vid_num not in self.vid_to_files:
-                self.vid_to_files[vid_num] = []
-            self.vid_to_files[vid_num].append(file)
-            
-        self.vid_nums = [int(f.stem.split('_')[0]) for f in self.video_files]
-        print("Max Video Number: ", max(self.vid_nums))
+        # Get all segment folders
+        self.segment_folders = sorted([d for d in self.data_root.iterdir() if d.is_dir()], 
+                                    key=lambda x: int(x.name.split('_')[1]))
+        
+        # Dictionary to store videos for each segment
+        self.segment_to_videos = {}
+        for folder in self.segment_folders:
+            segment_num = int(folder.name.split('_')[1])
+            self.segment_to_videos[segment_num] = sorted(list(folder.glob("*.mp4")))
+        
+        # Keep track of current segment for sampling
+        self.current_segment = int((self.segment_folders[0].name).split('_')[1])
+        self.video_files = self.segment_to_videos[self.current_segment]
+
+    def switch_segment(self):
+        """Randomly switch to a different segment"""
+        available_segments = list(self.segment_to_videos.keys())
+        available_segments.remove(self.current_segment)
+        if available_segments:
+            self.current_segment = random.choice(available_segments)
+            self.video_files = self.segment_to_videos[self.current_segment]
 
     def __len__(self):
         return len(self.video_files)
 
     def __getitem__(self, idx):
-    
         video_path = self.video_files[idx]
-        try:
+        try: 
             audio = extract_audio_from_video(video_path)
-            video_frame = load_and_preprocess_video(str(video_path), self.sample_fps)
-            return {
-                'video_path': str(video_path),
-                'video_frames': video_frame, 
-                'audio': audio,
-                'vid_num': int(video_path.stem.split('_')[0]),
-                'segment_num': int(video_path.stem.split('_')[1]),
-            }
         except Exception as e:
-            print(f"Error processing {self.video_files[idx]}: {str(e)}")
-            return {
-                'video_path': str(self.video_files[idx]),
-                'video_frames': torch.zeros(3, 224, 224),
-                'audio': torch.zeros(16331),
-                'vid_num': -1,
-                'segment_num': -1
-            }
+            print(f"Error processing {video_path} audio: {str(e)}")
+            audio = torch.zeros(16331)
+            
+        try:
+            video_frame = load_and_preprocess_video(str(video_path), self.sample_fps)
+        except Exception as e:
+            print(f"Error processing {video_path} video frame: {str(e)}")
+            video_frame = torch.zeros(3, 224, 224)
+            
+        return {
+            'video_path': str(video_path),
+            'video_frames': video_frame, 
+            'audio': audio,
+            'vid_num': int(video_path.stem.split('_')[0]),
+            'segment_num': self.current_segment
+        }
+        
 
 def collate_fn(batch):
     video_tokens = torch.stack([item['video_frames'] for item in batch])
@@ -220,37 +228,31 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    print("Testing LivisDataset...")
-    dset = datasets.load_dataset("/home/cis/heyo/DenseRead/livis")
-    dataset = LivisDataset(dset)
+    print("Testing LocalCaptionDataset...")
+    # Let's assume your data is in some directory - you'll need to change this path
+    dataset = LocalCaptionDataset("/home/cis/cc3m")
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
+    
     print("\nTesting batch loading...")
-    for batch_idx, (images, captions, short_captions) in enumerate(dataloader):
+    for batch_idx, (images, captions) in enumerate(dataloader):
         print(f"\nBatch {batch_idx + 1}")
-        print(f"Image batch shape: {images.shape}") # [batch_size, 3, 224, 224]
-        print(f"Caption batch shape: {captions.shape}") # [batch_size, 100]
-        print(f"Short caption batch shape: {short_captions.shape}") # [batch_size, 100]
-        print(f"Sample caption: {captions[0][:100]}...")
-        print(f"Sample short caption: {short_captions[0][:100]}...")
+        print(f"Image batch shape: {images.shape}")  # Should be [4, 3, 224, 224]
+        print(f"Sample caption: {captions[0]}")
+        # Let's just look at one batch to make sure everything's working
         break
 
-    print("Testing AudioVisualDataset...")
-
-    from torch.utils.data import DataLoader
-    from tqdm import tqdm
+    print("Testing AudioVisualDataset with segmented structure...")
+    
     dataset = AudioVisualDataset(
-        data_root="/home/cis/VGGSound_Splits",
+        data_root="/home/cis/GodSet",
         sample_fps=20
     )
 
-    batch_sampler = VideoBatchSampler(
-        vid_nums=dataset.vid_nums,
-        batch_size=2
-    )
-
+    # Now we can use a regular DataLoader since segments handle the sampling
     dataloader = DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
+        batch_size=2,
+        shuffle=True,  # We can shuffle within a segment
         num_workers=2,
         persistent_workers=True,
         pin_memory=True,
@@ -258,11 +260,16 @@ if __name__ == "__main__":
         prefetch_factor=2
     )
 
-    for batch in dataloader:
-        print(batch['frame'].shape) # [batch_size, 3, 224, 224]
-        print(batch['audio'].shape) # [batch_size, 16331]
-        print(batch['vid_nums']) # [batch_size]
-        print(batch['segment_nums']) # [batch_size]
-        print(batch['video_paths']) # [batch_size]
-        break
+    # Test a few batches
+    for batch_idx, batch in enumerate(dataloader):
+        print(f"\nBatch {batch_idx + 1}")
+        print(f"Current segment: {dataset.current_segment}")
+        print(f"Frame shape: {batch['frame'].shape}")
+        print(f"Audio shape: {batch['audio'].shape}")
+        print(f"Sample video path: {batch['video_paths'][0]}")
+        
+        # Switch segment every few batches
+        if batch_idx % 3 == 0:
+            dataset.switch_segment()
+            
         

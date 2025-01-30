@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
 from dataset import (
-    AudioVisualDataset, VideoBatchSampler, collate_fn,
-    LivisDataset
+    AudioVisualDataset, collate_fn,
+    LocalCaptionDataset
 )
 from model import MultiModalModel
 from viz import AudioVisualizer, TextVisualizer
@@ -33,11 +33,11 @@ def collate_text_fn(batch):
        'captions': list[str] of length B
     }
     """
-    images, captions, short_captions = zip(*batch)
+    images, captions = zip(*batch)
     images = torch.stack(images)  # shape => (B, 3, 224, 224)
     return {
         'images': images,
-        'captions': list(short_captions)  # or list(captions)
+        'captions': list(captions)
     }
 
 
@@ -120,23 +120,17 @@ class MultiModalTrainer:
             data_root=audio_visual_data_root,
             sample_fps=20
         )
-        batch_sampler = VideoBatchSampler(
-            vid_nums=self.av_dataset.vid_nums,
-            batch_size=batch_size_av
-        )
+        
         self.av_dataloader = DataLoader(
             self.av_dataset,
-            batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0),
             pin_memory=True,
-            prefetch_factor=8
+            prefetch_factor=4
         )
 
-        import datasets
-        hf_dset = datasets.load_dataset(text_dataset_path)
-        self.tv_dataset = LivisDataset(hf_dset, split='train')
+        self.tv_dataset = LocalCaptionDataset(text_dataset_path)
         self.tv_dataloader = DataLoader(
             self.tv_dataset,
             batch_size=batch_size_tv,
@@ -506,24 +500,24 @@ class MultiModalTrainer:
 if __name__ == "__main__":
 
     trainer = MultiModalTrainer(
-        audio_visual_data_root="/home/cis/VGGSound_Splits", 
-        text_dataset_path="/home/cis/heyo/DenseRead/livis",  
-        output_dir="./outputs_multimodal",
-        batch_size_av=20,
-        batch_size_tv=20,
+        audio_visual_data_root="/home/cis/GodSet", 
+        text_dataset_path="/home/cis/cc3m",  
+        output_dir="./outputs_multimodal_cc3m",
+        batch_size_av=16,
+        batch_size_tv=16,
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=True,  
+        use_wandb=False,  
         force_new_training=False,
-        vis_every=5000,
+        vis_every=10,
         save_every_steps=10000,
         num_workers=8,
         device="cuda",
-        gradient_accumulation_steps=2,
-        unfreeze_audio_epoch=1,
-        unfreeze_text_epoch=1,
-        unfreeze_vit_epoch=1,
-        project_name="Triad",
+        gradient_accumulation_steps=3,
+        unfreeze_audio_epoch=0,
+        unfreeze_text_epoch=0,
+        unfreeze_vit_epoch=0,
+        project_name="Triad-cc3m-godset",
         num_vis_samples_av=15,
         num_vis_samples_tv=15,
     )

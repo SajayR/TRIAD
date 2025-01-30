@@ -116,7 +116,7 @@ class ViTEmbedder(nn.Module):
     Example using DINOv2 from Facebook to extract patch embeddings from an image.
     Then projects to a common dimension with a linear layer.
     """
-    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vits14',
+    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
                  embedding_dim=512, dropout_prob=0.1):
         super().__init__()
         self.model = torch.hub.load(model_name, arch)
@@ -257,20 +257,30 @@ class MultiModalModel(nn.Module):
         """
         audio: (B, T) raw waveform
         frames: (B, 3, 224, 224)
-        
-        If training: returns scalar loss
-        If eval: returns token_sims
         """
-        #print(audio.shape)
+        # Store original grad states
+        text_grad_state = {}
+        for name, param in self.text_embedder.named_parameters():
+            text_grad_state[name] = param.requires_grad
+            param.requires_grad = False
+            
         visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
         audio_feats = self.audio_embedder(audio)         # (B, Na, D)
+        
+        result = None
         if self.training:
             clip_sims, token_sims = self.compute_all_similarities_av(audio_feats, visual_feats)
-            return self.compute_contrastive_loss_av(clip_sims, token_sims)
+            result = self.compute_contrastive_loss_av(clip_sims, token_sims)
         else:
-            # shape => (B, Na, Nv)
             token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
-            return token_sims
+            result = token_sims
+            
+        # Restore original grad states
+        for name, param in self.text_embedder.named_parameters():
+            param.requires_grad = text_grad_state[name]
+            
+        return result
+
 
     ######################################################
     #               TEXT-VISUAL PATH
@@ -362,22 +372,28 @@ class MultiModalModel(nn.Module):
         return total_loss
 
     def forward_text_visual(self, frames, text_list):
-        """
-        frames: (B, 3, 224, 224)
-        text_list: list of strings length B
-
-        If training: return scalar contrastive loss
-        else: return (sim_matrix, attention_mask)
-        """
+        # Store original grad states
+        audio_grad_state = {}
+        for name, param in self.audio_embedder.named_parameters():
+            audio_grad_state[name] = param.requires_grad
+            param.requires_grad = False
+            
         visual_feats = self.visual_embedder(frames)               # (B, Nv, D)
         text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
 
+        result = None
         if self.training:
             clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
+            result = self.compute_contrastive_loss_tv(clip_sims, token_sims)
         else:
-            sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
-            return sim_matrix, attention_mask
+            sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)
+            result = (sim_matrix, attention_mask)
+            
+        # Restore original grad states
+        for name, param in self.audio_embedder.named_parameters():
+            param.requires_grad = audio_grad_state[name]
+            
+        return result
         
     #during simple forward, we just return the embeddings of the modalities provided
     def forward(self, frames=None, audio=None, text_list=None):
