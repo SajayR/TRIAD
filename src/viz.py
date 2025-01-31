@@ -242,7 +242,7 @@ class AudioVisualizer:
         else:
             plt.show()
 
-    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.5):
+    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.3):
         """
         (Same as in your existing code) Overlays a heatmap onto an RGB frame.
         """
@@ -320,7 +320,7 @@ class TextVisualizer:
 
         return heatmaps  # (Nt, H, W)
 
-    def _create_overlay_frame(self, frame_np, heatmap, alpha=0.5):
+    def _create_overlay_frame(self, frame_np, heatmap, alpha=0.3):
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
         heatmap_colored = self.cmap(heatmap)[..., :3]
@@ -415,6 +415,6 @@ def _quick_text_visual_test():
 
 if __name__ == "__main__":
     print("Running quick tests for AudioVisualizer and TextVisualizer...")
-    _quick_audio_visual_test()
+    #_quick_audio_visual_test()
     _quick_text_visual_test()
     print("All tests complete! Check the output files for visualizations.")

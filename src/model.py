@@ -74,6 +74,7 @@ class TextEmbedder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
+        print("Using text model: ", model_name)
         
         for param in self.encoder.parameters():
             param.requires_grad = True
