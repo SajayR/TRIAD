@@ -10,8 +10,8 @@ from transformers import (
     AutoModel
 )
 warnings.filterwarnings("ignore")
-
-
+import torchvision.transforms as transforms
+from PIL import Image
 #################################################################
 #                   Audio Embedder
 #################################################################
@@ -384,6 +384,17 @@ class MultiModalModel(nn.Module):
     #during simple forward, we just return the embeddings of the modalities provided
     def forward(self, frames=None, audio=None, text_list=None):
         assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"
+        # we need to conver the image into the correct format and shit
+        assert frames is not str, "Frames should be a path to an image"
+        if frames is not None:
+            image = Image.open(frames).convert('RGB')
+            transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                              std=[0.229, 0.224, 0.225])
+            ])
+            frames = transform(image)
         embeddings = {}
         if frames is not None:
             embeddings['visual_feats'] = self.visual_embedder(frames)
