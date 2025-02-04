@@ -26,10 +26,10 @@ These feed into a shared cross-modal attention mechanism that learns to align fe
 
 ## Examples 
 ### Text-visual grounding
-![Text-visual grounding example](conts/Text_Visual.png)
+![Text-visual grounding example](src/conts/Text_Visual.png)
 
 ### Audio-visual grounding 
-![Audio-visual grounding example](conts/Audio_Visual.png)
+![Audio-visual grounding example](src/conts/Audio_Visual.png)
 
 
 ## Acknowledgments
