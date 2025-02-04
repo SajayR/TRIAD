@@ -25,7 +25,6 @@ The model uses three specialized backbones:
 These feed into a shared cross-modal attention mechanism that learns to align features across modalities. The model is trained using contrastive learning, pushing corresponding features closer while separating unrelated ones with a max-mean pooling strategy for dense feature learning.
 
 ## Examples 
-### Text-visual grounding
 ![Feature grounding example](src/conts/image.png)
 
 
