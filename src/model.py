@@ -17,7 +17,7 @@ from PIL import Image
 #################################################################
 class AudioEmbedder(nn.Module):
     """
-    Uses a pre-trained HuBERT (or similar) to extract audio features from raw audio (16kHz).
+    Pre-trained HuBERT to extract audio features from raw audio (16kHz).
     Projects them down to a desired embedding dimension.
     """
     def __init__(self, embedding_dim=512, hubert_name="facebook/hubert-base-ls960"):
@@ -66,7 +66,7 @@ class AudioEmbedder(nn.Module):
 #################################################################
 class TextEmbedder(nn.Module):
     """
-    Uses a pre-trained BERT-like model (ModernBERT or similar) to extract text features.
+    pre-trained BERT-like model to extract text features.
     Projects them down to a desired embedding dimension.
     """
     def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base"):
@@ -114,7 +114,7 @@ class TextEmbedder(nn.Module):
 #################################################################
 class ViTEmbedder(nn.Module):
     """
-    Example using DINOv2 from Facebook to extract patch embeddings from an image.
+    DINOv2to extract patch embeddings from an image.
     Then projects to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
@@ -140,6 +140,8 @@ class ViTEmbedder(nn.Module):
         #print(f"x shape: {x.shape}")
         if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
             x = x.squeeze(0)  # get [1, 3, 224, 224]
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
         feats = self.projection(patches)
         feats = self.dropout(feats)
@@ -154,7 +156,7 @@ class MultiModalModel(nn.Module):
     def __init__(
         self, 
         audio_model_name="facebook/hubert-base-ls960",
-        text_model_name="answerdotai/ModernBERT-base",
+        text_model_name="distilbert/distilbert-base-uncased",
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
@@ -203,18 +205,15 @@ class MultiModalModel(nn.Module):
             token_sims: (B, B, Na, Nv) raw token-level sims
         """
         B = audio_feats.shape[0]
-
         # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
-
         # dot product => (B, B, Na, Nv)
         token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
         # max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
         # mean over audio dimension => (B, B)
         clip_sims = torch.mean(max_sims, dim=2)
-
         return clip_sims, token_sims
 
     def compute_regularization_losses_av(self, token_sims):
@@ -234,7 +233,6 @@ class MultiModalModel(nn.Module):
         temp_high = torch.clamp(torch.log(self.temperature) 
                                 - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 4
         l_cal = temp_low + temp_high
-
         reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)
         return reg_loss
 
@@ -293,13 +291,10 @@ class MultiModalModel(nn.Module):
 
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-
         # token-level similarity => (B, B, Nt, Nv)
         token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature
-
         # max over visual dimension => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
-
         # we need masked mean over Nt
         # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
         mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
@@ -319,7 +314,6 @@ class MultiModalModel(nn.Module):
         # 1) negative clamp
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims**2)
-
         # 2) patch usage sparsity (for the diagonal pairs only)
         positive_sims = []
         for i in range(B):
@@ -327,19 +321,14 @@ class MultiModalModel(nn.Module):
             positive_sims.append(token_sims[i, i])
         if len(positive_sims) == 0:
             return 0.15 * l_nonneg
-
         positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
-
         # softmax over patches => (B, Nt, Nv)
         patch_probs = F.softmax(positive_sims, dim=-1)
-
         # fraction usage per patch => sum over Nt, then / Nt => (B, Nv)
         patch_fraction = patch_probs.sum(dim=1) / patch_probs.shape[1]
-
         # penalize if fraction > threshold
         excess = F.relu(patch_fraction - self.patch_sparsity_threshold)  # (B, Nv)
         loss_sparsity = (excess ** 2).mean()
-
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
         return reg_loss
 
@@ -381,8 +370,7 @@ class MultiModalModel(nn.Module):
         else:
             sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
             return sim_matrix, attention_mask
-        
-    #during simple forward, we just return the embeddings of the modalities provided
+
     def forward(self, frames=None, audio=None, text_list=None):
         assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"
         # we need to conver the image into the correct format and shit

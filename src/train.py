@@ -70,7 +70,6 @@ class MultiModalTrainer:
         num_epochs: int = 20,
         learning_rate: float = 1e-4,
         gradient_accumulation_steps: int = 1,
-        # Step-based unfreeze thresholds
         unfreeze_audio_step: int = 2000,
         unfreeze_text_step: int = 5000,
         unfreeze_vit_step: int = 8000,
@@ -103,8 +102,6 @@ class MultiModalTrainer:
         self.vis_every = vis_every
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
-
-        # Store main config
         self.config = {
             "batch_size_av": batch_size_av,
             "batch_size_tv": batch_size_tv,
@@ -117,8 +114,6 @@ class MultiModalTrainer:
             "vis_every": vis_every,
             "save_every_steps": save_every_steps
         }
-
-        # Logging setup
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
             level=logging.INFO,
@@ -217,7 +212,6 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         #  4) Multiple OneCycle schedulers
         # -----------------------------------------------------
-        # Step counts
         total_steps_per_epoch = max(len(self.av_dataloader), len(self.tv_dataloader))
         self.steps_per_epoch = total_steps_per_epoch
         self.total_updates = (self.steps_per_epoch * num_epochs) // self.gradient_accumulation_steps
@@ -334,12 +328,10 @@ class MultiModalTrainer:
             "current_batch_idx": self.current_batch_idx,
             "rng_state": rng_state,
             "model_state_dict": self.model.state_dict(),
-            # Save each optimizer
             "opt_others_state": self.opt_others.state_dict(),
             "opt_audio_state":  self.opt_audio.state_dict(),
             "opt_text_state":   self.opt_text.state_dict(),
             "opt_vit_state":    self.opt_vit.state_dict(),
-            # Save each scheduler
             "sched_others_state": self.sched_others.state_dict(),
             "sched_audio_state":  self.sched_audio.state_dict(),
             "sched_text_state":   self.sched_text.state_dict(),
@@ -348,7 +340,6 @@ class MultiModalTrainer:
             "sched_step_audio":  self.step_audio,
             "sched_step_text":   self.step_text,
             "sched_step_vit":    self.step_vit,
-
             "best_loss": self.best_loss,
             "config": self.config,
             "vis_samples_av": self.vis_samples_av,
@@ -362,24 +353,18 @@ class MultiModalTrainer:
         ck = torch.load(ckpt_path, map_location=self.device)
 
         self.model.load_state_dict(ck["model_state_dict"])
-
-        # Load each optimizer state
         self.opt_others.load_state_dict(ck["opt_others_state"])
         self.opt_audio.load_state_dict(ck["opt_audio_state"])
         self.opt_text.load_state_dict(ck["opt_text_state"])
         self.opt_vit.load_state_dict(ck["opt_vit_state"])
-
-        # Load schedulers
         self.sched_others.load_state_dict(ck["sched_others_state"])
         self.sched_audio.load_state_dict(ck["sched_audio_state"])
         self.sched_text.load_state_dict(ck["sched_text_state"])
         self.sched_vit.load_state_dict(ck["sched_vit_state"])
-
         self.step_others = ck.get("sched_step_others", 0)
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
         self.step_vit    = ck.get("sched_step_vit", 0)
-
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
@@ -404,8 +389,6 @@ class MultiModalTrainer:
 
         self.vis_samples_av = ck["vis_samples_av"]
         self.vis_samples_tv = ck["vis_samples_tv"]
-
-        # Make sure param freezing is correct for the loaded step
         self._update_frozen_params(self.global_step)
 
         self.logger.info(
@@ -544,12 +527,10 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
-
-            # Fresh iterators
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
-            # If resuming in the middle of an epoch...
+            # If resuming in the middle of an epoch
             for _ in range(self.current_batch_idx):
                 try:
                     next(self.av_iter)
@@ -568,10 +549,7 @@ class MultiModalTrainer:
             epoch_losses = []
 
             for batch_idx in pbar:
-                # Update freeze/unfreeze for this step
                 self._update_frozen_params(self.global_step)
-
-                # 1) Get AV batch
                 try:
                     av_batch = next(self.av_iter)
                 except StopIteration:
@@ -579,8 +557,6 @@ class MultiModalTrainer:
                     av_batch = next(self.av_iter)
                 frames_av = av_batch['frame'].to(self.device)
                 audio_av  = av_batch['audio'].to(self.device)
-
-                # 2) Get TV batch
                 try:
                     tv_batch = next(self.tv_iter)
                 except StopIteration:
@@ -588,27 +564,21 @@ class MultiModalTrainer:
                     tv_batch = next(self.tv_iter)
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv  = tv_batch['captions']
-
-                # 3) Forward => losses
                 self.model.train()
                 loss_av = self.model.forward_audio_visual(frames_av, audio_av)
                 loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
                 loss_total = loss_av + loss_tv
-
-                # 4) Backward (with gradient accumulation)
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
                 accumulation_counter += 1
 
                 if (accumulation_counter % self.gradient_accumulation_steps) == 0:
-                    # Clip
                     clip_grad_norm_(self.model.parameters(), 1.0)
 
                     # ---- Step each optimizer *if* unfrozen. ----
                     # "Others" is always unfrozen
                     self.opt_others.step()
                     self.opt_others.zero_grad()
-                    # Step scheduler for others
                     if self.step_others < self.total_updates:
                         self.sched_others.step()
                         self.step_others += 1
@@ -628,7 +598,6 @@ class MultiModalTrainer:
                     if self.global_step >= self.config['unfreeze_text_step']:
                         self.opt_text.step()
                         self.opt_text.zero_grad()
-                        # Step scheduler
                         if self.step_text < (self.total_updates - self.config['unfreeze_text_step']):
                             self.sched_text.step()
                             self.step_text += 1
@@ -639,14 +608,11 @@ class MultiModalTrainer:
                     if self.global_step >= self.config['unfreeze_vit_step']:
                         self.opt_vit.step()
                         self.opt_vit.zero_grad()
-                        # Step scheduler
                         if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
                             self.sched_vit.step()
                             self.step_vit += 1
                     else:
                         self.opt_vit.zero_grad()
-
-                # Logging
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
                 pbar.set_postfix({"loss": f"{loss_val:.4f}"})
@@ -658,7 +624,6 @@ class MultiModalTrainer:
                         "loss_tv": loss_tv.item(),
                         "epoch": epoch,
                         "global_step": self.global_step,
-                        # We can also log separate LRs
                         "lr_others": self.opt_others.param_groups[0]['lr'],
                         "lr_audio":  self.opt_audio.param_groups[0]['lr'],
                         "lr_text":   self.opt_text.param_groups[0]['lr'],
@@ -668,30 +633,18 @@ class MultiModalTrainer:
 
                 del frames_av, audio_av, frames_tv, texts_tv, loss_total
                 torch.cuda.empty_cache()
-
-                # Housekeeping
                 if self.global_step % 500 == 0:
                     gc.collect()
-
-                # Visualization
                 if (self.global_step > 0) and (self.global_step % self.vis_every == 0):
                     self.visualize_samples(epoch)
-
-                # Periodic checkpoint
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
 
                 self.global_step += 1
-
-            # End of epoch
             epoch_loss = np.mean(epoch_losses)
             self.logger.info(f"Epoch {epoch} completed. Average loss={epoch_loss:.4f}")
-
-            # Reset batch offset at end of epoch
             self.current_batch_idx = 0
-
-            # Save final checkpoint for the epoch
             self.save_checkpoint(epoch, self.global_step)
 
         self.logger.info("Training complete!")

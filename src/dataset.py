@@ -34,8 +34,6 @@ class LocalCaptionDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                               std=[0.229, 0.224, 0.225])
         ])
-        
-        # Get all image files recursively
         self.image_files = list(self.root_dir.rglob("*.jpg"))
         
     def __len__(self):
@@ -46,12 +44,9 @@ class LocalCaptionDataset(Dataset):
         txt_path = img_path.with_suffix('.txt')
         
         try:
-            # Load and process image
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
-                
-            # Load caption
             with open(txt_path, 'r') as f:
                 caption = f.read().strip()
                 
@@ -74,11 +69,11 @@ def extract_audio_from_video(video_path: Path) -> torch.Tensor:
         for frame in container.decode(audio):
             frame.pts = None
             resampled = resampler.resample(frame)
-            if resampled:  # Safety check
+            if resampled:  
                 frame = resampled[0]
                 samples.append(frame.to_ndarray().reshape(-1))
 
-        if not samples:  # Another safety check if we got no samples
+        if not samples:  
             return torch.zeros(16331)
 
         samples = torch.tensor(np.concatenate(samples))
@@ -161,18 +156,12 @@ class AudioVisualDataset(Dataset):
     def __init__(self, data_root: str, sample_fps: int = 20):
         self.data_root = Path(data_root)
         self.sample_fps = sample_fps
-        
-        # Get all segment folders
         self.segment_folders = sorted([d for d in self.data_root.iterdir() if d.is_dir()], 
                                     key=lambda x: int(x.name.split('_')[1]))
-        
-        # Dictionary to store videos for each segment
         self.segment_to_videos = {}
         for folder in self.segment_folders:
             segment_num = int(folder.name.split('_')[1])
             self.segment_to_videos[segment_num] = sorted(list(folder.glob("*.mp4")))
-        
-        # Keep track of current segment for sampling
         self.current_segment = int((self.segment_folders[0].name).split('_')[1])
         self.video_files = self.segment_to_videos[self.current_segment]
 
@@ -229,7 +218,6 @@ def collate_fn(batch):
 
 if __name__ == "__main__":
     print("Testing LocalCaptionDataset...")
-    # Let's assume your data is in some directory - you'll need to change this path
     dataset = LocalCaptionDataset("/home/cis/cc3m")
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
     
@@ -238,7 +226,6 @@ if __name__ == "__main__":
         print(f"\nBatch {batch_idx + 1}")
         print(f"Image batch shape: {images.shape}")  # Should be [4, 3, 224, 224]
         print(f"Sample caption: {captions[0]}")
-        # Let's just look at one batch to make sure everything's working
         break
 
     print("Testing AudioVisualDataset with segmented structure...")
@@ -247,28 +234,22 @@ if __name__ == "__main__":
         data_root="/home/cis/GodSet",
         sample_fps=20
     )
-
-    # Now we can use a regular DataLoader since segments handle the sampling
     dataloader = DataLoader(
         dataset,
         batch_size=2,
-        shuffle=True,  # We can shuffle within a segment
+        shuffle=True,
         num_workers=2,
         persistent_workers=True,
         pin_memory=True,
         collate_fn=collate_fn,
         prefetch_factor=2
     )
-
-    # Test a few batches
     for batch_idx, batch in enumerate(dataloader):
         print(f"\nBatch {batch_idx + 1}")
         print(f"Current segment: {dataset.current_segment}")
         print(f"Frame shape: {batch['frame'].shape}")
         print(f"Audio shape: {batch['audio'].shape}")
         print(f"Sample video path: {batch['video_paths'][0]}")
-        
-        # Switch segment every few batches
         if batch_idx % 3 == 0:
             dataset.switch_segment()
             

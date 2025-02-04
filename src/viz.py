@@ -43,7 +43,7 @@ class AudioVisualizer:
 
     def get_attention_maps(self, model, frame, audio):
         """
-        Given a model (e.g. MultiModalModel) and a single image+audio,
+        Given a model and a single image+audio,
         get the token-level similarity => shape: (Na, Nv).
         Then convert to a set of heatmaps of shape: (Na, H, W).
         """
@@ -93,7 +93,7 @@ class AudioVisualizer:
         Create attention visualization video - synchronized to 1s duration if your data is 1s.
         
         Args:
-            model: your MultiModalModel or equivalent
+            model: blahblah
             frame: ImageNet normalized frame tensor [C, H, W]  (or [1, C, H, W] if you prefer)
             audio: normalized audio tensor [T] or [1, T]
             output_path: path to save the final .mp4
@@ -106,18 +106,14 @@ class AudioVisualizer:
           3) If `video_path` is given, we use ffmpeg to mux the *original audio* from `video_path` into our new frames.
              This replicates the logic you had in your original code.
         """
-        # If necessary, reshape so it's (1, C, H, W):
+        #reshape so it's (1, C, H, W):
         if frame.ndim == 3:
             frame = frame.unsqueeze(0)
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
         
         self._validate_inputs(frame, audio)
-        
-        # Compute attention maps => shape (Na, H, W)
         attention_maps = self.get_attention_maps(model, frame, audio)  # calls compute_similarity_matrix => upsample
-
-        # Denormalize the image to [0..255]
         frame_np = frame.squeeze(0).permute(1, 2, 0).cpu().numpy()
         mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
         std  = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
@@ -168,7 +164,6 @@ class AudioVisualizer:
         Create multi-subplot figure showing attention overlays for a few audio tokens.
         
         Args:
-            model: The MultiModalModel (set to eval mode outside).
             frame: (3, H, W) ImageNet normalized frame
             audio: (T,) raw audio waveform or a snippet
             output_path: Optional path to save figure (png)
@@ -179,7 +174,6 @@ class AudioVisualizer:
             2) We'll pick some indices from the audio token dimension (Na).
             3) We'll upsample each patch map => overlay => subplot.
         """
-        # Denormalize the frame
         frame_np = frame.permute(1,2,0).cpu().numpy()
         mean = np.array([0.485, 0.456, 0.406]).reshape(1,1,3)
         std  = np.array([0.229, 0.224, 0.225]).reshape(1,1,3)
@@ -221,16 +215,12 @@ class AudioVisualizer:
         axes = axes.flatten()
 
         for i, token_idx in enumerate(selected_indices):
-            # overlay
             attn_map = heatmaps[token_idx].cpu().numpy()
             overlay = self.create_overlay_frame(frame_np, attn_map)
-            
             ax = axes[i]
             ax.imshow(overlay)
             ax.set_title(f"Audio token {token_idx}")
             ax.axis('off')
-
-        # Hide any unused subplots
         for ax in axes[len(selected_indices):]:
             ax.axis('off')
 
@@ -244,7 +234,7 @@ class AudioVisualizer:
 
     def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.3):
         """
-        (Same as in your existing code) Overlays a heatmap onto an RGB frame.
+        Overlays a heatmap onto an RGB frame.
         """
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
@@ -308,7 +298,6 @@ class TextVisualizer:
         """
         Nt, Nv = patch_attention.shape
         patches = patch_attention.reshape(Nt, self.num_patches, self.num_patches)
-        # Square for contrast
         patches = patches ** 2
 
         heatmaps = F.interpolate(
@@ -334,8 +323,6 @@ class TextVisualizer:
         """
         attention_maps, tokens = self.get_token_attention_maps(model, frame, text)
         Nt = attention_maps.shape[0]
-
-        # Denormalize the image
         frame_np = frame.permute(1, 2, 0).cpu().numpy()
         mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
         std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
@@ -378,19 +365,14 @@ def _quick_audio_visual_test():
     from model import MultiModalModel
     model = MultiModalModel()
     model.eval()
-
-    # Create dummy data
     frame = torch.ones(3, 224, 224)
     mean = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
     frame = (frame - mean) / std
-
     #audio = torch.randn(16331)  # 1 sec at 16kHz
     t = torch.linspace(0, 2*torch.pi, 16331)
     audio = torch.sin(2 * torch.pi * 440 * t) # [16331]
-    
     viz = AudioVisualizer()
-
     out_file = "test_audio_attention.mp4"
     viz.make_attention_video(model, frame, audio, out_file, fps=5)
 
@@ -407,8 +389,6 @@ def _quick_text_visual_test():
 
     text = "a dog playing in the park"
     viz = TextVisualizer()
-
-    # Just display or save to file
     out_file = "test_text_attention.png"
     viz.plot_token_attentions(model, frame, text, output_path=out_file)
 
