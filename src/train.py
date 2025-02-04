@@ -49,13 +49,15 @@ def collate_text_fn(batch):
 ###########################################
 class MultiModalTrainer:
     """
-    Trainer that sums AudioVisual and TextVisual losses in the same step.
-    Uses two separate dataloaders: one for Audio-Visual, one for Text-Visual.
+    Trainer that sums AudioVisual and TextVisual losses in the same step,
+    but uses multiple optimizers & schedulers:
+      - One param group for "others" (always unfrozen from step=0).
+      - One param group for audio (unfreeze at unfreeze_audio_step).
+      - One param group for text  (unfreeze at unfreeze_text_step).
+      - One param group for vision(unfreeze at unfreeze_vit_step).
 
-    Now uses a *step-based* unfreezing schedule instead of an epoch-based schedule:
-    - If current_step >= unfreeze_audio_step => set LR for audio encoder to the normal LR, else 0.0
-    - If current_step >= unfreeze_text_step  => set LR for text encoder to the normal LR, else 0.0
-    - If current_step >= unfreeze_vit_step   => set LR for ViT to the normal LR, else 0.0
+    Each param group has a separate OneCycleLR that starts its warmup
+    the moment that group is unfrozen.
     """
 
     def __init__(
@@ -68,7 +70,7 @@ class MultiModalTrainer:
         num_epochs: int = 20,
         learning_rate: float = 1e-4,
         gradient_accumulation_steps: int = 1,
-        # Step-based unfreeze thresholds (instead of epoch-based)
+        # Step-based unfreeze thresholds
         unfreeze_audio_step: int = 2000,
         unfreeze_text_step: int = 5000,
         unfreeze_vit_step: int = 8000,
@@ -87,14 +89,10 @@ class MultiModalTrainer:
             audio_visual_data_root: path to video dataset (mp4 files)
             text_dataset_path:      path to images & text files (LocalCaptionDataset)
             output_dir:             where to save logs/checkpoints
-            batch_size_av:          batch size for AudioVisual loader
-            batch_size_tv:          batch size for TextVisual loader
-            num_epochs:             total number of epochs
-            learning_rate:          base LR for 'unfrozen' groups
-            gradient_accumulation_steps: how many steps to accumulate before optimizer step
-            unfreeze_audio_step, unfreeze_text_step, unfreeze_vit_step:
-                after these step counts, set LR from 0.0 to the normal LR for each encoder
             ...
+            unfreeze_audio_step, unfreeze_text_step, unfreeze_vit_step:
+                after these step counts, set requires_grad=True for each module
+                and start their OneCycleLR from step=0 to (total_updates - unfreeze_step).
         """
         self.device = device
         self.output_dir = Path(output_dir)
@@ -106,7 +104,7 @@ class MultiModalTrainer:
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
 
-        # Store main config in a dict for logging or potential checkpoint usage
+        # Store main config
         self.config = {
             "batch_size_av": batch_size_av,
             "batch_size_tv": batch_size_tv,
@@ -131,7 +129,6 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         #  1) Datasets / Dataloaders
         # -----------------------------------------------------
-        # a) AudioVisual dataset
         self.av_dataset = AudioVisualDataset(
             data_root=audio_visual_data_root,
             sample_fps=20
@@ -147,7 +144,6 @@ class MultiModalTrainer:
             prefetch_factor=3
         )
 
-        # b) Text-Visual dataset
         self.tv_dataset = LocalCaptionDataset(text_dataset_path)
         self.tv_dataloader = DataLoader(
             self.tv_dataset,
@@ -160,7 +156,6 @@ class MultiModalTrainer:
             prefetch_factor=8
         )
 
-        # Iterators will be (re)created each epoch
         self.av_iter = None
         self.tv_iter = None
 
@@ -169,7 +164,7 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         self.model = MultiModalModel(
             audio_model_name="facebook/hubert-base-ls960",
-            #text_model_name="answerdotai/ModernBERT-base",
+            # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=2.0,
             patch_sparsity_threshold=0.3,
@@ -178,7 +173,7 @@ class MultiModalTrainer:
         ).to(self.device)
 
         # -----------------------------------------------------
-        #  3) Separate param groups for unfreeze logic
+        #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         audio_params = []
         text_params  = []
@@ -194,20 +189,42 @@ class MultiModalTrainer:
             else:
                 others_params.append(param)
 
-        # Freeze them at start: set LR=0. We'll unfreeze in _adjust_lr_for_frozen_params
-        self.optimizer = torch.optim.AdamW([
-            {"params": others_params, "lr": learning_rate},   # group 0 => 'others' always active
-            {"params": audio_params,  "lr": 0.0},             # group 1 => 'audio'
-            {"params": text_params,   "lr": 0.0},             # group 2 => 'text'
-            {"params": vit_params,    "lr": 0.0},             # group 3 => 'vision'
-        ])
+        # (a) Optimizer for "others" (train from start)
+        self.opt_others = torch.optim.AdamW(
+            others_params, lr=learning_rate
+        )
+        # (b) Audio optimizer (frozen at start)
+        self.opt_audio = torch.optim.AdamW(
+            audio_params, lr=learning_rate
+        )
+        # (c) Text optimizer
+        self.opt_text = torch.optim.AdamW(
+            text_params, lr=learning_rate
+        )
+        # (d) Vision optimizer
+        self.opt_vit = torch.optim.AdamW(
+            vit_params, lr=learning_rate
+        )
 
-        # Scheduler: single OneCycle for the total steps
+        # We'll freeze audio/text/vit from step=0:
+        for p in audio_params:
+            p.requires_grad = False
+        for p in text_params:
+            p.requires_grad = False
+        for p in vit_params:
+            p.requires_grad = False
+
+        # -----------------------------------------------------
+        #  4) Multiple OneCycle schedulers
+        # -----------------------------------------------------
+        # Step counts
         total_steps_per_epoch = max(len(self.av_dataloader), len(self.tv_dataloader))
         self.steps_per_epoch = total_steps_per_epoch
-        self.total_updates = self.steps_per_epoch * num_epochs // self.gradient_accumulation_steps
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
+        self.total_updates = (self.steps_per_epoch * num_epochs) // self.gradient_accumulation_steps
+
+        # We want "others" to run from 0 to self.total_updates
+        self.sched_others = torch.optim.lr_scheduler.OneCycleLR(
+            self.opt_others,
             max_lr=learning_rate,
             total_steps=self.total_updates,
             pct_start=0.1,
@@ -215,16 +232,54 @@ class MultiModalTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
+        # Audio starts at unfreeze_audio_step => full cycle from there to end
+        audio_cycle = max(1, self.total_updates - unfreeze_audio_step)
+        self.sched_audio = torch.optim.lr_scheduler.OneCycleLR(
+            self.opt_audio,
+            max_lr=learning_rate,
+            total_steps=audio_cycle,
+            pct_start=0.1,
+            div_factor=10,
+            final_div_factor=1e4,
+            anneal_strategy='cos'
+        )
+        # Text
+        text_cycle = max(1, self.total_updates - unfreeze_text_step)
+        self.sched_text = torch.optim.lr_scheduler.OneCycleLR(
+            self.opt_text,
+            max_lr=learning_rate,
+            total_steps=text_cycle,
+            pct_start=0.1,
+            div_factor=10,
+            final_div_factor=1e4,
+            anneal_strategy='cos'
+        )
+        # Vision
+        vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
+        self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
+            self.opt_vit,
+            max_lr=learning_rate,
+            total_steps=vit_cycle,
+            pct_start=0.1,
+            div_factor=10,
+            final_div_factor=1e4,
+            anneal_strategy='cos'
+        )
+
+        # Local step counters for each scheduler
+        self.step_others = 0
+        self.step_audio  = 0
+        self.step_text   = 0
+        self.step_vit    = 0
 
         # -----------------------------------------------------
-        #  4) State tracking & optional resume
+        #  5) State tracking & optional resume
         # -----------------------------------------------------
         self.start_epoch = 0
         self.global_step = 0
-        self.current_batch_idx = 0   # offset inside the epoch
+        self.current_batch_idx = 0
         self.best_loss = float('inf')
 
-        # Optionally restore from latest checkpoint if found
         if self.use_wandb and not force_new_training:
             ckpt = self.find_latest_checkpoint()
             if ckpt:
@@ -236,13 +291,14 @@ class MultiModalTrainer:
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, config=self.config)
 
-        # Visualization utilities
+        # Visualization
         self.audio_viz = AudioVisualizer()
         self.text_viz  = TextVisualizer()
         self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av)
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv)
 
-        self.logger.info("Initialized MultiModalTrainer")
+        self.logger.info("Initialized MultiModalTrainer with multiple schedulers.")
+
 
     ###########################################
     #     Checkpointing Helpers
@@ -254,8 +310,7 @@ class MultiModalTrainer:
 
         def _parse_ckpt_name(p):
             """
-            e.g. filename: 'checkpoint_epoch3_step1500.pt'
-            parse out epoch=3, step=1500 as (3, 1500)
+            e.g. 'checkpoint_epoch3_step1500.pt' => (3,1500)
             """
             name = p.stem
             ep_str = name.split('epoch')[1].split('_')[0]  # '3'
@@ -265,12 +320,7 @@ class MultiModalTrainer:
         return max(ckpts, key=_parse_ckpt_name)
 
     def save_checkpoint(self, epoch, step):
-        """
-        Saves everything needed to resume from the same batch and random states.
-        """
         ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}_step{step}.pt"
-
-        # Save random states so we preserve shuffle order on resume
         rng_state = {
             "torch": torch.get_rng_state(),
             "cuda":  torch.cuda.get_rng_state_all(),
@@ -284,8 +334,21 @@ class MultiModalTrainer:
             "current_batch_idx": self.current_batch_idx,
             "rng_state": rng_state,
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            # Save each optimizer
+            "opt_others_state": self.opt_others.state_dict(),
+            "opt_audio_state":  self.opt_audio.state_dict(),
+            "opt_text_state":   self.opt_text.state_dict(),
+            "opt_vit_state":    self.opt_vit.state_dict(),
+            # Save each scheduler
+            "sched_others_state": self.sched_others.state_dict(),
+            "sched_audio_state":  self.sched_audio.state_dict(),
+            "sched_text_state":   self.sched_text.state_dict(),
+            "sched_vit_state":    self.sched_vit.state_dict(),
+            "sched_step_others": self.step_others,
+            "sched_step_audio":  self.step_audio,
+            "sched_step_text":   self.step_text,
+            "sched_step_vit":    self.step_vit,
+
             "best_loss": self.best_loss,
             "config": self.config,
             "vis_samples_av": self.vis_samples_av,
@@ -299,44 +362,51 @@ class MultiModalTrainer:
         ck = torch.load(ckpt_path, map_location=self.device)
 
         self.model.load_state_dict(ck["model_state_dict"])
-        self.optimizer.load_state_dict(ck["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ck["scheduler_state_dict"])
+
+        # Load each optimizer state
+        self.opt_others.load_state_dict(ck["opt_others_state"])
+        self.opt_audio.load_state_dict(ck["opt_audio_state"])
+        self.opt_text.load_state_dict(ck["opt_text_state"])
+        self.opt_vit.load_state_dict(ck["opt_vit_state"])
+
+        # Load schedulers
+        self.sched_others.load_state_dict(ck["sched_others_state"])
+        self.sched_audio.load_state_dict(ck["sched_audio_state"])
+        self.sched_text.load_state_dict(ck["sched_text_state"])
+        self.sched_vit.load_state_dict(ck["sched_vit_state"])
+
+        self.step_others = ck.get("sched_step_others", 0)
+        self.step_audio  = ck.get("sched_step_audio", 0)
+        self.step_text   = ck.get("sched_step_text", 0)
+        self.step_vit    = ck.get("sched_step_vit", 0)
+
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
 
-        # restore random states if present
         rng_state = ck.get("rng_state", None)
         if rng_state is not None:
-            # Convert to a CPU ByteTensor for the global generator
+            # torch RNG
             torch_state = rng_state["torch"]
             if not isinstance(torch_state, torch.Tensor):
-                # might be list / np.array
                 torch_state = torch.tensor(torch_state, dtype=torch.uint8)
-            else:
-                # if it's already a tensor, we still ensure CPU + uint8
-                torch_state = torch_state.detach().cpu().to(dtype=torch.uint8)
-            torch.set_rng_state(torch_state)
+            torch.set_rng_state(torch_state.cpu())
 
-            # For each CUDA device in rng_state["cuda"], do the same:
+            # cuda RNG
             for i, cuda_state in enumerate(rng_state["cuda"]):
                 if not isinstance(cuda_state, torch.Tensor):
                     cuda_state = torch.tensor(cuda_state, dtype=torch.uint8)
-                else:
-                    cuda_state = cuda_state.detach().cpu().to(dtype=torch.uint8)
-                # Now move it onto the correct CUDA device before set_rng_state
-                torch.cuda.set_rng_state(cuda_state, device=i)
+                torch.cuda.set_rng_state(cuda_state.cpu(), device=i)
 
-            # Restore numpy / python states
             np.random.set_state(rng_state["numpy"])
             random.setstate(rng_state["python"])
 
         self.vis_samples_av = ck["vis_samples_av"]
         self.vis_samples_tv = ck["vis_samples_tv"]
 
-        # Make sure to adjust LR for any steps that might already require unfreezing
-        self._adjust_lr_for_frozen_params(self.global_step)
+        # Make sure param freezing is correct for the loaded step
+        self._update_frozen_params(self.global_step)
 
         self.logger.info(
             f"Checkpoint loaded (epoch={self.start_epoch}, step={self.global_step}, "
@@ -345,46 +415,46 @@ class MultiModalTrainer:
 
 
     ###########################################
-    #  Step-Based Unfreeze schedule
+    #  Freeze/Unfreeze logic
     ###########################################
-    def _adjust_lr_for_frozen_params(self, current_step: int):
+    def _update_frozen_params(self, current_step: int):
         """
-        If current_step < unfreeze_*_step, set that param group's LR = 0.
-        Else keep the LR as set by OneCycleLR (or any other scheduler).
+        Switch requires_grad to True if current_step >= unfreeze_*_step,
+        else keep them False. This ensures no momentum buildup in optimizers
+        for modules that are still frozen.
         """
-        for i, pg in enumerate(self.optimizer.param_groups):
-            if i == 0:  # 'others' group never frozen
-                continue
+        # Audio
+        audio_module = self.model.audio_embedder.hubert
+        if current_step < self.config['unfreeze_audio_step']:
+            for p in audio_module.parameters():
+                p.requires_grad = False
+        else:
+            for p in audio_module.parameters():
+                p.requires_grad = True
 
-            # The scheduler might have just set some value for pg["lr"].
-            # We'll zero it out if we haven't reached unfreeze step.
-            current_scheduler_lr = pg["lr"]
+        # Text
+        text_module = self.model.text_embedder.encoder
+        if current_step < self.config['unfreeze_text_step']:
+            for p in text_module.parameters():
+                p.requires_grad = False
+        else:
+            for p in text_module.parameters():
+                p.requires_grad = True
 
-            if i == 1:  # audio
-                if current_step < self.config['unfreeze_audio_step']:
-                    pg["lr"] = 0.0
-                else:
-                    pg["lr"] = current_scheduler_lr
-            elif i == 2:  # text
-                if current_step < self.config['unfreeze_text_step']:
-                    pg["lr"] = 0.0
-                else:
-                    pg["lr"] = current_scheduler_lr
-            elif i == 3:  # vision
-                if current_step < self.config['unfreeze_vit_step']:
-                    pg["lr"] = 0.0
-                else:
-                    pg["lr"] = current_scheduler_lr
+        # Vision
+        vision_module = self.model.visual_embedder.model
+        if current_step < self.config['unfreeze_vit_step']:
+            for p in vision_module.parameters():
+                p.requires_grad = False
+        else:
+            for p in vision_module.parameters():
+                p.requires_grad = True
 
 
     ###########################################
     #     Visualization logic
     ###########################################
     def _get_av_vis_samples(self, n_samples=2):
-        """
-        Pull a small batch from av_dataloader for visualization.
-        We'll store them on CPU as well.
-        """
         batch = next(iter(self.av_dataloader))
         idxs = range(min(n_samples, len(batch['frame'])))
 
@@ -399,10 +469,6 @@ class MultiModalTrainer:
         }
 
     def _get_tv_vis_samples(self, n_samples=2):
-        """
-        Pull a small batch from the tv_dataloader for visualization.
-        Store them on CPU as well.
-        """
         batch = next(iter(self.tv_dataloader))
         images = batch['images']
         captions = batch['captions']
@@ -415,10 +481,6 @@ class MultiModalTrainer:
         }
 
     def visualize_samples(self, epoch):
-        """
-        We'll create a snapshot for a few audio+visual pairs and text+visual pairs,
-        storing them or logging to wandb if enabled.
-        """
         self.model.eval()
 
         # 1) Audio-Visual
@@ -482,12 +544,12 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
-            
+
             # Fresh iterators
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
-            # If resuming in the middle of an epoch, skip the first self.current_batch_idx steps:
+            # If resuming in the middle of an epoch...
             for _ in range(self.current_batch_idx):
                 try:
                     next(self.av_iter)
@@ -505,12 +567,9 @@ class MultiModalTrainer:
             pbar = tqdm(range(max_steps), desc=f"Epoch {epoch}")
             epoch_losses = []
 
-            # Now we can start from batch_idx=0; we do NOT do `if batch_idx < current_batch_idx: continue`
-            # because we've already advanced the iterator outside the loop.
             for batch_idx in pbar:
-
-                # Step-based unfreeze check for this step
-                self._adjust_lr_for_frozen_params(self.global_step)
+                # Update freeze/unfreeze for this step
+                self._update_frozen_params(self.global_step)
 
                 # 1) Get AV batch
                 try:
@@ -542,13 +601,50 @@ class MultiModalTrainer:
                 accumulation_counter += 1
 
                 if (accumulation_counter % self.gradient_accumulation_steps) == 0:
-                    # optimizer step
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    # Clip
+                    clip_grad_norm_(self.model.parameters(), 1.0)
 
-                    # scheduler step
-                    self.scheduler.step()
+                    # ---- Step each optimizer *if* unfrozen. ----
+                    # "Others" is always unfrozen
+                    self.opt_others.step()
+                    self.opt_others.zero_grad()
+                    # Step scheduler for others
+                    if self.step_others < self.total_updates:
+                        self.sched_others.step()
+                        self.step_others += 1
+
+                    # Audio if current_step >= unfreeze_audio_step
+                    if self.global_step >= self.config['unfreeze_audio_step']:
+                        self.opt_audio.step()
+                        self.opt_audio.zero_grad()
+                        # Step scheduler if we have not exhausted steps
+                        if self.step_audio < (self.total_updates - self.config['unfreeze_audio_step']):
+                            self.sched_audio.step()
+                            self.step_audio += 1
+                    else:
+                        self.opt_audio.zero_grad()
+
+                    # Text if current_step >= unfreeze_text_step
+                    if self.global_step >= self.config['unfreeze_text_step']:
+                        self.opt_text.step()
+                        self.opt_text.zero_grad()
+                        # Step scheduler
+                        if self.step_text < (self.total_updates - self.config['unfreeze_text_step']):
+                            self.sched_text.step()
+                            self.step_text += 1
+                    else:
+                        self.opt_text.zero_grad()
+
+                    # Vision if current_step >= unfreeze_vit_step
+                    if self.global_step >= self.config['unfreeze_vit_step']:
+                        self.opt_vit.step()
+                        self.opt_vit.zero_grad()
+                        # Step scheduler
+                        if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
+                            self.sched_vit.step()
+                            self.step_vit += 1
+                    else:
+                        self.opt_vit.zero_grad()
 
                 # Logging
                 loss_val = loss_total.item()
@@ -562,12 +658,13 @@ class MultiModalTrainer:
                         "loss_tv": loss_tv.item(),
                         "epoch": epoch,
                         "global_step": self.global_step,
+                        # We can also log separate LRs
+                        "lr_others": self.opt_others.param_groups[0]['lr'],
+                        "lr_audio":  self.opt_audio.param_groups[0]['lr'],
+                        "lr_text":   self.opt_text.param_groups[0]['lr'],
+                        "lr_vit":    self.opt_vit.param_groups[0]['lr'],
                     }
-                    for i, pg in enumerate(self.optimizer.param_groups):
-                        wandb_dict[f"lr_group{i}"] = pg["lr"]
                     wandb.log(wandb_dict)
-
-                
 
                 del frames_av, audio_av, frames_tv, texts_tv, loss_total
                 torch.cuda.empty_cache()
@@ -577,11 +674,11 @@ class MultiModalTrainer:
                     gc.collect()
 
                 # Visualization
-                if self.global_step % self.vis_every == 0:
+                if (self.global_step > 0) and (self.global_step % self.vis_every == 0):
                     self.visualize_samples(epoch)
 
-                # Save checkpoint periodically
-                if self.global_step % self.save_every_steps == 0:
+                # Periodic checkpoint
+                if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
 
@@ -591,7 +688,7 @@ class MultiModalTrainer:
             epoch_loss = np.mean(epoch_losses)
             self.logger.info(f"Epoch {epoch} completed. Average loss={epoch_loss:.4f}")
 
-            # Reset batch offset at end of an epoch
+            # Reset batch offset at end of epoch
             self.current_batch_idx = 0
 
             # Save final checkpoint for the epoch
@@ -604,13 +701,12 @@ class MultiModalTrainer:
 #        Main Script
 ###########################################
 if __name__ == "__main__":
-    print("Starting multi-modal training example...")
+    print("Starting multi-modal training example with multiple schedulers...")
 
-    # Example usage:
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m",
-        output_dir="./outputs_multimodal_cc3m_wtf",
+        output_dir="./outputs_multimodal_cc3m_wtf_pls",
         batch_size_av=18,
         batch_size_tv=18,
         num_epochs=10,
@@ -622,10 +718,10 @@ if __name__ == "__main__":
         num_workers=8,
         device="cuda",
         gradient_accumulation_steps=3,
-        unfreeze_audio_step=50000,
-        unfreeze_text_step=50000,
-        unfreeze_vit_step=50000,
-        project_name="Triad-cc3m-godset_fudgeme",
+        unfreeze_audio_step=5000,
+        unfreeze_text_step=5000,
+        unfreeze_vit_step=5000,
+        project_name="Triad-cc3m-godset_multiSched",
         num_vis_samples_av=18,
         num_vis_samples_tv=18,
     )

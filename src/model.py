@@ -225,7 +225,7 @@ class MultiModalModel(nn.Module):
         """
         # 1) Non-negative pressure
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
-        l_nonneg = torch.mean(neg_sims ** 2)
+        l_nonneg = torch.mean(neg_sims ** 4)
 
         # 2) Temperature calibration
         #    force it between [1,4] or sumn man idk.
