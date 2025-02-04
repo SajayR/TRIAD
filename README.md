@@ -13,7 +13,7 @@ Unlike models like ImageBind that focus on global alignment between modalities, 
 - Get dense feature maps that work across all three modalities
 - (Unvalidated) Allow for transitive text-audio feature grounding without any explicit pairs in dataset
 
-The model is also relatively lightweight and can be trained on consumer hardware - the results here were achieved with a single RTX 3080.
+The model is also relatively lightweight and can be trained on consumer hardware - the results here were achieved with a single RTX 3080. (Given you have enough patience ofcourse)
 
 ## Architecture 
 
