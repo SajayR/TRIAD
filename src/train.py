@@ -527,6 +527,7 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
+            self.av_dataset.switch_segment()
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
