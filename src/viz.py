@@ -77,7 +77,7 @@ class AudioVisualizer:
 
         return heatmaps  # shape: (Na, H, W)
 
-    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.5):
+    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.45):
         """Overlay a heatmap onto an RGB frame."""
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
@@ -232,7 +232,7 @@ class AudioVisualizer:
         else:
             plt.show()
 
-    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.3):
+    def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.45):
         """
         Overlays a heatmap onto an RGB frame.
         """
@@ -309,7 +309,7 @@ class TextVisualizer:
 
         return heatmaps  # (Nt, H, W)
 
-    def _create_overlay_frame(self, frame_np, heatmap, alpha=0.3):
+    def _create_overlay_frame(self, frame_np, heatmap, alpha=0.45):
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
         heatmap_colored = self.cmap(heatmap)[..., :3]
