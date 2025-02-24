@@ -326,6 +326,7 @@ class MultiModalTrainer:
             "epoch": epoch,
             "step": step,
             "current_batch_idx": self.current_batch_idx,
+            "current_segment": self.av_dataset.current_segment,
             "rng_state": rng_state,
             "model_state_dict": self.model.state_dict(),
             "opt_others_state": self.opt_others.state_dict(),
@@ -369,6 +370,7 @@ class MultiModalTrainer:
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
+        self.av_dataset.current_segment = ck["current_segment"]
 
         rng_state = ck.get("rng_state", None)
         if rng_state is not None:
@@ -527,7 +529,9 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
-            self.av_dataset.switch_segment()
+            if self.current_batch_idx == 0:  # Fresh epoch
+                print("Switching segment")
+                self.av_dataset.switch_segment()
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
