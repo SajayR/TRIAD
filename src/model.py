@@ -216,6 +216,22 @@ class MultiModalModel(nn.Module):
         clip_sims = torch.mean(max_sims, dim=2)
         return clip_sims, token_sims
 
+    def compute_temporal_smoothness_loss(self, token_sims):
+        """
+        Computes temporal smoothness loss for audio-visual attention maps.
+        
+        Args:
+            token_sims: Tensor of shape (B, B, Na, Nv)
+            
+        Returns:
+            Scalar temporal smoothness loss
+        """
+        B = token_sims.shape[0]
+        diagonal_sims = torch.stack([token_sims[i, i] for i in range(B)])  # Shape: (B, Na, Nv)
+        temporal_diffs = diagonal_sims[:, 1:] - diagonal_sims[:, :-1]  # Shape: (B, Na-1, Nv)
+        smoothness_loss = torch.mean(temporal_diffs ** 2)
+        return smoothness_loss
+
     def compute_regularization_losses_av(self, token_sims):
         """
         Based on the old AudioVisualModel, includes:
@@ -233,7 +249,9 @@ class MultiModalModel(nn.Module):
         temp_high = torch.clamp(torch.log(self.temperature) 
                                 - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 4
         l_cal = temp_low + temp_high
-        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)
+
+        l_smooth = self.compute_temporal_smoothness_loss(token_sims)
+        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg + 0.1 * l_smooth)
         return reg_loss
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):

@@ -279,11 +279,11 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, config=self.config)
+                wandb.init(project=self.project_name, name="smooth", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, config=self.config)
+            wandb.init(project=self.project_name, name="smooth", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, config=self.config)
+            wandb.init(project=self.project_name, name="smooth", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -664,7 +664,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m",
-        output_dir="./outputs_multimodal_cc3m_wtf_pls",
+        output_dir="./outputs",
         batch_size_av=18,
         batch_size_tv=18,
         num_epochs=10,
@@ -679,7 +679,7 @@ if __name__ == "__main__":
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
-        project_name="Triad-cc3m-godset_multiSched",
+        project_name="Triad",
         num_vis_samples_av=18,
         num_vis_samples_tv=18,
     )
