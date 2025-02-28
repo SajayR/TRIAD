@@ -172,7 +172,8 @@ class AudioVisualDataset(Dataset):
         if available_segments:
             self.current_segment = random.choice(available_segments)
             self.video_files = self.segment_to_videos[self.current_segment]
-
+            print(f"Switching segment to {self.current_segment}")
+            
     def __len__(self):
         return len(self.video_files)
 
@@ -236,13 +237,13 @@ if __name__ == "__main__":
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=2,
+        batch_size=18,
         shuffle=True,
-        num_workers=2,
+        num_workers=8,
         persistent_workers=True,
         pin_memory=True,
         collate_fn=collate_fn,
-        prefetch_factor=2
+        prefetch_factor=3
     )
     for batch_idx, batch in enumerate(dataloader):
         print(f"\nBatch {batch_idx + 1}")

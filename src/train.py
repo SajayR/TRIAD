@@ -124,6 +124,7 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         #  1) Datasets / Dataloaders
         # -----------------------------------------------------
+        print("Loading AudioVisualDataset...")
         self.av_dataset = AudioVisualDataset(
             data_root=audio_visual_data_root,
             sample_fps=20
@@ -138,7 +139,8 @@ class MultiModalTrainer:
             collate_fn=collate_fn,
             prefetch_factor=3
         )
-
+        print("AudioVisualDataset loaded")
+        print("Loading LocalCaptionDataset...")
         self.tv_dataset = LocalCaptionDataset(text_dataset_path)
         self.tv_dataloader = DataLoader(
             self.tv_dataset,
@@ -150,7 +152,7 @@ class MultiModalTrainer:
             persistent_workers=(num_workers > 0),
             prefetch_factor=8
         )
-
+        print("LocalCaptionDataset loaded")
         self.av_iter = None
         self.tv_iter = None
 
@@ -273,9 +275,12 @@ class MultiModalTrainer:
         self.global_step = 0
         self.current_batch_idx = 0
         self.best_loss = float('inf')
-
+        print("Force new training: ", force_new_training)
+        print("Use wandb: ", self.use_wandb)
         if self.use_wandb and not force_new_training:
+            print("Loading checkpoint")
             ckpt = self.find_latest_checkpoint()
+            print("Checkpoint found: ", ckpt)
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
@@ -284,6 +289,8 @@ class MultiModalTrainer:
             wandb.init(project=self.project_name, name="smooth", config=self.config)
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, name="smooth", config=self.config)
+
+        print("Loaded checkpoint")
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -366,9 +373,9 @@ class MultiModalTrainer:
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
         self.step_vit    = ck.get("sched_step_vit", 0)
-        self.start_epoch = ck["epoch"]
+        self.start_epoch = ck["epoch"]+1
         self.global_step = ck["step"]
-        self.current_batch_idx = ck.get("current_batch_idx", 0)
+        self.current_batch_idx = 0 #ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         self.av_dataset.current_segment = ck["current_segment"]
 
@@ -529,14 +536,15 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
-            if self.current_batch_idx == 0:  # Fresh epoch
+            if self.current_batch_idx == 0 or self.start_epoch == 2:  # Fresh epoch
                 print("Switching segment")
                 self.av_dataset.switch_segment()
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
             # If resuming in the middle of an epoch
-            for _ in range(self.current_batch_idx):
+            print(f"Resuming from batch {self.current_batch_idx}")
+            for _ in tqdm(range(self.current_batch_idx), desc="Resuming from checkpoint"):
                 try:
                     next(self.av_iter)
                 except StopIteration:

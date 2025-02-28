@@ -251,7 +251,7 @@ class MultiModalModel(nn.Module):
         l_cal = temp_low + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg + 0.1 * l_smooth)
+        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)# + 0.1 * l_smooth)
         return reg_loss
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
