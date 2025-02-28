@@ -382,7 +382,7 @@ class MultiModalTrainer:
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
         self.step_lora = ck.get("sched_step_lora", 0)
-        self.start_epoch = ck["epoch"]+1
+        self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
