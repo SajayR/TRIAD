@@ -81,7 +81,9 @@ class MultiModalTrainer:
         save_every_steps: int = 10000,
         num_workers: int = 4,
         device: str = "cuda",
-        force_new_training: bool = False
+        force_new_training: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: int = 32
     ):
         """
         Args:
@@ -161,54 +163,63 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         self.model = MultiModalModel(
             audio_model_name="facebook/hubert-base-ls960",
-            # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=2.0,
             patch_sparsity_threshold=0.3,
             patch_sparsity_weight=0.1,
-            visual_dropout_prob=0.1
+            visual_dropout_prob=0.1,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha
         ).to(self.device)
 
         # -----------------------------------------------------
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         audio_params = []
-        text_params  = []
-        vit_params   = []
-        others_params= []
+        text_params = []
+        vit_lora_params = []
+        others_params = []
+
         for name, param in self.model.named_parameters():
             if "audio_embedder.hubert" in name:
                 audio_params.append(param)
             elif "text_embedder.encoder" in name:
                 text_params.append(param)
-            elif "visual_embedder.model" in name:
-                vit_params.append(param)
+            # Target all LoRA parameters based on the naming pattern
+            elif "visual_embedder.model.base_model" in name and "lora" in name and param.requires_grad:
+                vit_lora_params.append(param)
+            elif "visual_embedder.projection" in name:
+                others_params.append(param)
             else:
                 others_params.append(param)
 
+        print(f"Number of LoRA parameters: {len(vit_lora_params)}")
+
+        # Only create the optimizer if we have parameters
+        if len(vit_lora_params) > 0:
+            self.opt_lora = torch.optim.AdamW(vit_lora_params, lr=learning_rate * 2)
+        else:
+            print("WARNING: No LoRA parameters found! Check implementation.")
+            # Create dummy optimizer with a learnable parameter to avoid errors
+            dummy_param = nn.Parameter(torch.zeros(1, requires_grad=True))
+            self.opt_lora = torch.optim.AdamW([dummy_param], lr=learning_rate)
+
         # (a) Optimizer for "others" (train from start)
-        self.opt_others = torch.optim.AdamW(
-            others_params, lr=learning_rate
-        )
+        self.opt_others = torch.optim.AdamW(others_params, lr=learning_rate)
+    
         # (b) Audio optimizer (frozen at start)
-        self.opt_audio = torch.optim.AdamW(
-            audio_params, lr=learning_rate
-        )
+        self.opt_audio = torch.optim.AdamW(audio_params, lr=learning_rate)
+        
         # (c) Text optimizer
-        self.opt_text = torch.optim.AdamW(
-            text_params, lr=learning_rate
-        )
-        # (d) Vision optimizer
-        self.opt_vit = torch.optim.AdamW(
-            vit_params, lr=learning_rate
-        )
+        self.opt_text = torch.optim.AdamW(text_params, lr=learning_rate)
+        
+        # (d) LoRA optimizer (replaces the VIT optimizer)
+        self.opt_lora = torch.optim.AdamW(vit_lora_params, lr=learning_rate * 2)
 
         # We'll freeze audio/text/vit from step=0:
         for p in audio_params:
             p.requires_grad = False
         for p in text_params:
-            p.requires_grad = False
-        for p in vit_params:
             p.requires_grad = False
 
         # -----------------------------------------------------
@@ -222,6 +233,15 @@ class MultiModalTrainer:
         self.sched_others = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_others,
             max_lr=learning_rate,
+            total_steps=self.total_updates,
+            pct_start=0.1,
+            div_factor=10,
+            final_div_factor=1e4,
+            anneal_strategy='cos'
+        )
+        self.sched_lora = torch.optim.lr_scheduler.OneCycleLR(
+            self.opt_lora,
+            max_lr=learning_rate * 2,  # Higher LR for adapters
             total_steps=self.total_updates,
             pct_start=0.1,
             div_factor=10,
@@ -250,23 +270,12 @@ class MultiModalTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
-        # Vision
-        vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
-        self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt_vit,
-            max_lr=learning_rate,
-            total_steps=vit_cycle,
-            pct_start=0.1,
-            div_factor=10,
-            final_div_factor=1e4,
-            anneal_strategy='cos'
-        )
 
         # Local step counters for each scheduler
         self.step_others = 0
         self.step_audio  = 0
         self.step_text   = 0
-        self.step_vit    = 0
+        self.step_lora = 0
 
         # -----------------------------------------------------
         #  5) State tracking & optional resume
@@ -284,11 +293,11 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, name="smooth", config=self.config)
+                wandb.init(project=self.project_name, name="triad-lora", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="smooth", config=self.config)
+            wandb.init(project=self.project_name, name="triad-lora", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="smooth", config=self.config)
+            wandb.init(project=self.project_name, name="triad-lora", config=self.config)
 
         print("Loaded checkpoint")
 
@@ -339,15 +348,15 @@ class MultiModalTrainer:
             "opt_others_state": self.opt_others.state_dict(),
             "opt_audio_state":  self.opt_audio.state_dict(),
             "opt_text_state":   self.opt_text.state_dict(),
-            "opt_vit_state":    self.opt_vit.state_dict(),
+            "opt_lora_state": self.opt_lora.state_dict(),
             "sched_others_state": self.sched_others.state_dict(),
             "sched_audio_state":  self.sched_audio.state_dict(),
             "sched_text_state":   self.sched_text.state_dict(),
-            "sched_vit_state":    self.sched_vit.state_dict(),
+            "sched_lora_state": self.sched_lora.state_dict(),
             "sched_step_others": self.step_others,
             "sched_step_audio":  self.step_audio,
             "sched_step_text":   self.step_text,
-            "sched_step_vit":    self.step_vit,
+            "sched_step_lora": self.step_lora,
             "best_loss": self.best_loss,
             "config": self.config,
             "vis_samples_av": self.vis_samples_av,
@@ -364,18 +373,18 @@ class MultiModalTrainer:
         self.opt_others.load_state_dict(ck["opt_others_state"])
         self.opt_audio.load_state_dict(ck["opt_audio_state"])
         self.opt_text.load_state_dict(ck["opt_text_state"])
-        self.opt_vit.load_state_dict(ck["opt_vit_state"])
+        self.opt_lora.load_state_dict(ck["opt_lora_state"])
         self.sched_others.load_state_dict(ck["sched_others_state"])
         self.sched_audio.load_state_dict(ck["sched_audio_state"])
         self.sched_text.load_state_dict(ck["sched_text_state"])
-        self.sched_vit.load_state_dict(ck["sched_vit_state"])
+        self.sched_lora.load_state_dict(ck["sched_lora_state"])
         self.step_others = ck.get("sched_step_others", 0)
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
-        self.step_vit    = ck.get("sched_step_vit", 0)
+        self.step_lora = ck.get("sched_step_lora", 0)
         self.start_epoch = ck["epoch"]+1
         self.global_step = ck["step"]
-        self.current_batch_idx = 0 #ck.get("current_batch_idx", 0)
+        self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         self.av_dataset.current_segment = ck["current_segment"]
 
@@ -536,7 +545,7 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
-            if self.current_batch_idx == 0 or self.start_epoch == 2:  # Fresh epoch
+            if self.current_batch_idx == 0:  # Fresh epoch
                 print("Switching segment")
                 self.av_dataset.switch_segment()
             self.av_iter = iter(self.av_dataloader)
@@ -596,6 +605,12 @@ class MultiModalTrainer:
                         self.sched_others.step()
                         self.step_others += 1
 
+                    self.opt_lora.step()
+                    self.opt_lora.zero_grad()
+                    if self.step_lora < self.total_updates:
+                        self.sched_lora.step()
+                        self.step_lora += 1
+
                     # Audio if current_step >= unfreeze_audio_step
                     if self.global_step >= self.config['unfreeze_audio_step']:
                         self.opt_audio.step()
@@ -617,15 +632,7 @@ class MultiModalTrainer:
                     else:
                         self.opt_text.zero_grad()
 
-                    # Vision if current_step >= unfreeze_vit_step
-                    if self.global_step >= self.config['unfreeze_vit_step']:
-                        self.opt_vit.step()
-                        self.opt_vit.zero_grad()
-                        if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
-                            self.sched_vit.step()
-                            self.step_vit += 1
-                    else:
-                        self.opt_vit.zero_grad()
+                    
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
                 pbar.set_postfix({"loss": f"{loss_val:.4f}"})
@@ -640,7 +647,7 @@ class MultiModalTrainer:
                         "lr_others": self.opt_others.param_groups[0]['lr'],
                         "lr_audio":  self.opt_audio.param_groups[0]['lr'],
                         "lr_text":   self.opt_text.param_groups[0]['lr'],
-                        "lr_vit":    self.opt_vit.param_groups[0]['lr'],
+                        "lr_lora": self.opt_lora.param_groups[0]['lr']
                     }
                     wandb.log(wandb_dict)
 
@@ -672,7 +679,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m",
-        output_dir="./outputs",
+        output_dir="./outputs_lora",
         batch_size_av=18,
         batch_size_tv=18,
         num_epochs=10,
@@ -683,13 +690,16 @@ if __name__ == "__main__":
         save_every_steps=5000,
         num_workers=8,
         device="cuda",
-        gradient_accumulation_steps=3,
+        gradient_accumulation_steps=4,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
         project_name="Triad",
         num_vis_samples_av=18,
         num_vis_samples_tv=18,
+        lora_rank=8,
+        lora_alpha=16
+
     )
 
     trainer.train()

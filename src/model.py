@@ -12,6 +12,12 @@ from transformers import (
 warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
+
+from peft import (
+    LoraConfig, 
+    get_peft_model,
+    TaskType,
+)
 #################################################################
 #                   Audio Embedder
 #################################################################
@@ -95,7 +101,7 @@ class TextEmbedder(nn.Module):
             padding=True,
             truncation=True,
             add_special_tokens=False,
-            max_length=128,
+            max_length=64,
             return_tensors="pt"
         )
         device = next(self.parameters()).device
@@ -112,21 +118,48 @@ class TextEmbedder(nn.Module):
 #################################################################
 #                   Visual Embedder
 #################################################################
-class ViTEmbedder(nn.Module):
+class ViTLoRAEmbedder(nn.Module):
     """
-    DINOv2to extract patch embeddings from an image.
-    Then projects to a common dimension with a linear layer.
+    DINOv2 with LoRA adapters for parameter-efficient fine-tuning.
+    Projects output embeddings to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=512, dropout_prob=0.1):
+                 embedding_dim=512, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
         super().__init__()
+        
+        # Load the base model
         self.model = torch.hub.load(model_name, arch)
-        print("Using DINOv2 model: ", arch)
+        print(f"Using DINOv2 model with LoRA adapters: {arch}")
+        
+        # Freeze the base model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # Define which attention layers to apply LoRA to
+        # Based on our understanding of the model architecture
+        target_modules = ["attn.qkv", "attn.proj"]
+        
+        # LoRA configuration
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            inference_mode=False,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=dropout_prob,
+        )
+        
+        # Apply LoRA to the model
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # Print trainable parameters to confirm LoRA setup
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"ViTLoRAEmbedder - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
+        
+        # Add a projection layer to match the expected embedding dimension
         self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
         self.dropout = nn.Dropout(p=dropout_prob)
-
-        for param in self.model.parameters():
-            param.requires_grad = True
 
     def forward(self, x):
         """
@@ -137,12 +170,13 @@ class ViTEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        #print(f"x shape: {x.shape}")
         if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
             x = x.squeeze(0)  # get [1, 3, 224, 224]
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
-        patches = self.model.get_intermediate_layers(x, n=1)[0]  
+            
+        # Use intermediate layers for feature extraction - same as original
+        patches = self.model.get_intermediate_layers(x, n=1)[0]
         feats = self.projection(patches)
         feats = self.dropout(feats)
         
@@ -160,15 +194,21 @@ class MultiModalModel(nn.Module):
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
-        visual_dropout_prob=0.1
+        visual_dropout_prob=0.1,
+        lora_rank=16,
+        lora_alpha=32
     ):
         super().__init__()
 
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
-        self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14',
-                                           embedding_dim=512,
-                                           dropout_prob=visual_dropout_prob)
+        self.visual_embedder = ViTLoRAEmbedder(
+            arch='dinov2_vitb14',
+            embedding_dim=512,
+            dropout_prob=visual_dropout_prob,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha
+        )
 
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold
@@ -251,7 +291,7 @@ class MultiModalModel(nn.Module):
         l_cal = temp_low + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)# + 0.1 * l_smooth)
+        reg_loss = (8.0 * l_cal + 0.5 * l_nonneg + 0.1 * l_smooth)
         return reg_loss
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
