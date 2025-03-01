@@ -139,7 +139,7 @@ class MultiModalTrainer:
             persistent_workers=(num_workers > 0),
             pin_memory=True,
             collate_fn=collate_fn,
-            prefetch_factor=3
+            prefetch_factor=4
         )
         print("AudioVisualDataset loaded")
         print("Loading LocalCaptionDataset...")
@@ -152,7 +152,7 @@ class MultiModalTrainer:
             collate_fn=collate_text_fn,
             pin_memory=True,
             persistent_workers=(num_workers > 0),
-            prefetch_factor=8
+            prefetch_factor=6
         )
         print("LocalCaptionDataset loaded")
         self.av_iter = None
@@ -293,11 +293,11 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, name="triad-lora", config=self.config)
+                wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="triad-lora", config=self.config)
+            wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="triad-lora", config=self.config)
+            wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
 
         print("Loaded checkpoint")
 
@@ -442,15 +442,6 @@ class MultiModalTrainer:
             for p in text_module.parameters():
                 p.requires_grad = True
 
-        # Vision
-        vision_module = self.model.visual_embedder.model
-        if current_step < self.config['unfreeze_vit_step']:
-            for p in vision_module.parameters():
-                p.requires_grad = False
-        else:
-            for p in vision_module.parameters():
-                p.requires_grad = True
-
 
     ###########################################
     #     Visualization logic
@@ -543,6 +534,16 @@ class MultiModalTrainer:
     ###########################################
     def train(self):
         accumulation_counter = 0
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Total parameters: {total_params:,}")
+        self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params:.2%})")
+        if self.use_wandb:
+            wandb.log({
+                "total_parameters": total_params,
+                "trainable_parameters": trainable_params,
+                "trainable_percentage": trainable_params/total_params
+            })
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
             if self.current_batch_idx == 0:  # Fresh epoch
@@ -680,23 +681,23 @@ if __name__ == "__main__":
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m",
         output_dir="./outputs_lora",
-        batch_size_av=18,
-        batch_size_tv=18,
+        batch_size_av=26,
+        batch_size_tv=26,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
         vis_every=5000,
         save_every_steps=5000,
-        num_workers=8,
+        num_workers=12,
         device="cuda",
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
         project_name="Triad",
-        num_vis_samples_av=18,
-        num_vis_samples_tv=18,
+        num_vis_samples_av=20,
+        num_vis_samples_tv=20,
         lora_rank=8,
         lora_alpha=16
 
