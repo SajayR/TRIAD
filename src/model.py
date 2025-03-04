@@ -194,26 +194,40 @@ class MultiModalModel(nn.Module):
     ######################################################
     def compute_all_similarities_av(self, audio_feats, visual_feats):
         """
-        Cross-batch approach: compute pairwise similarities for all 
-        (audio_i, visual_j) in the batch.
+        Cross-batch approach with Dynamic Relevance Pooling: only tokens with
+        statistically significant matches contribute to the final similarity.
         
         audio_feats: (B, Na, D)
         visual_feats: (B, Nv, D)
         
         Returns:
-            clip_sims: (B, B)  for the aggregated similarity
-            token_sims: (B, B, Na, Nv) raw token-level sims
+            clip_sims: (B, B) aggregated similarity with relevance pooling
+            token_sims: (B, B, Na, Nv) raw token-level similarities
         """
         B = audio_feats.shape[0]
         # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
-        # dot product => (B, B, Na, Nv)
+        
+        # Compute token-level similarities: (B, B, Na, Nv)
         token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
-        # max over visual dimension => (B, B, Na)
+        
+        # Max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
-        # mean over audio dimension => (B, B)
-        clip_sims = torch.mean(max_sims, dim=2)
+        
+        # Compute z-scores to find statistically significant tokens
+        mean_sim = max_sims.mean(dim=2, keepdim=True)  # (B, B, 1)
+        std_sim = torch.std(max_sims, dim=2, keepdim=True).clamp(min=1e-5)  # (B, B, 1)
+        z_scores = (max_sims - mean_sim) / std_sim  # (B, B, Na)
+        
+        # Create relevance mask: only above-average tokens contribute
+        relevance_mask = (z_scores > 0).float()  # (B, B, Na)
+        
+        # Compute weighted average using the relevance mask
+        weighted_sum = (max_sims * relevance_mask).sum(dim=2)  # (B, B)
+        token_count = relevance_mask.sum(dim=2).clamp(min=1)  # (B, B)
+        clip_sims = weighted_sum / token_count  # (B, B)
+        
         return clip_sims, token_sims
 
     def compute_temporal_smoothness_loss(self, token_sims):
@@ -296,7 +310,9 @@ class MultiModalModel(nn.Module):
     ######################################################
     def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
         """
-        cross-batch approach: (text_i, visual_j)
+        Cross-batch approach with Dynamic Relevance Pooling for text-visual.
+        Combines attention mask with statistical relevance.
+        
         text_feats:   (B, Nt, D)
         visual_feats: (B, Nv, D)
         attention_mask: (B, Nt)
@@ -308,18 +324,50 @@ class MultiModalModel(nn.Module):
         B = text_feats.shape[0]
 
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-        # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature
-        # max over visual dimension => (B, B, Nt)
-        max_sims = torch.max(token_sims, dim=3)[0]
-        # we need masked mean over Nt
-        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
-        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
-        valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
-        clip_sims = masked_sum / valid_tokens
-
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)  # (B, B, Nv, D)
+        
+        # Compute token-level similarities
+        token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature  # (B, B, Nt, Nv)
+        
+        # Max over visual dimension
+        max_sims = torch.max(token_sims, dim=3)[0]  # (B, B, Nt)
+        
+        # Expand attention mask to match shape
+        attn_mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)  # (B, B, Nt)
+        
+        # Compute z-scores for statistical significance (within attention mask)
+        # We need to calculate mean and std only over valid tokens
+        masked_max_sims = max_sims * attn_mask  # Only consider valid tokens
+        
+        # Sum of valid similarities
+        sum_sims = masked_max_sims.sum(dim=2, keepdim=True)  # (B, B, 1)
+        # Count of valid tokens
+        valid_count = attn_mask.sum(dim=2, keepdim=True).clamp(min=1e-7)  # (B, B, 1)
+        # Mean of valid similarities
+        mean_sim = sum_sims / valid_count  # (B, B, 1)
+        
+        # Calculate variance
+        squared_diff = ((masked_max_sims - mean_sim) * attn_mask) ** 2  # (B, B, Nt)
+        variance = squared_diff.sum(dim=2, keepdim=True) / valid_count.clamp(min=1)  # (B, B, 1)
+        std_sim = torch.sqrt(variance).clamp(min=1e-5)  # (B, B, 1)
+        
+        # Compute z-scores
+        z_scores = (max_sims - mean_sim) / std_sim  # (B, B, Nt)
+        
+        # Combined mask: token must be valid (attention_mask) AND statistically relevant (z_score > 0)
+        relevance_mask = attn_mask * (z_scores > 0).float()  # (B, B, Nt)
+        
+        # Ensure we have at least one relevant token per pair
+        # If a row in relevance_mask is all zeros, fall back to just using the attention mask
+        has_relevant = relevance_mask.sum(dim=2) > 0  # (B, B)
+        fallback_mask = ~has_relevant.unsqueeze(2) * attn_mask  # (B, B, Nt) 
+        final_mask = relevance_mask + fallback_mask  # (B, B, Nt)
+        
+        # Compute weighted average
+        weighted_sum = (max_sims * final_mask).sum(dim=2)  # (B, B)
+        token_count = final_mask.sum(dim=2).clamp(min=1)  # (B, B)
+        clip_sims = weighted_sum / token_count  # (B, B)
+        
         return clip_sims, token_sims
 
     def compute_regularization_losses_tv(self, token_sims):
@@ -422,32 +470,107 @@ class MultiModalModel(nn.Module):
 #################################################################
 #                        Quick Test
 #################################################################
+#################################################################
+#                        Quick Test
+#################################################################
+#################################################################
+#                        Quick Test
+#################################################################
 if __name__ == "__main__":
-    print("Testing MultiModalModel with random inputs...")
+    print("Testing MultiModalModel with Dynamic Relevance Pooling...")
     model = MultiModalModel(
         audio_model_name="facebook/hubert-base-ls960",
-        text_model_name="answerdotai/ModernBERT-base",
+        text_model_name="distilbert/distilbert-base-uncased",
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1
     )
-    batch_size = 2
-    dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
-    dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
-    dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
+    
+    # Test batch with varied content
+    batch_size = 4
+    dummy_frames = torch.randn(batch_size, 3, 224, 224)
+    dummy_audio = torch.randn(batch_size, 16000)
+    dummy_texts = [
+        "a man riding a bicycle near a mountain",
+        "a cat sleeping on a comfortable bed",
+        "the sunset over the ocean horizon",
+        "birds flying in the clear blue sky"
+    ]
+    
+    # 1. Basic forward pass test
+    print("\n=== Testing forward passes ===")
     model.train()
     av_loss = model.forward_audio_visual(dummy_frames, dummy_audio)
-    print(f"Audio-Visual loss: {av_loss.item():.4f}")
     tv_loss = model.forward_text_visual(dummy_frames, dummy_texts)
+    print(f"Audio-Visual loss: {av_loss.item():.4f}")
     print(f"Text-Visual loss: {tv_loss.item():.4f}")
+    
+    # 2. Gradient flow test
+    print("\n=== Testing gradient flow ===")
+    model.zero_grad()
+    combined_loss = av_loss + tv_loss
+    combined_loss.backward()
+    
+    # Check gradients on parameters, not modules
+    print("\nChecking gradients on key parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.grad is None:
+                print(f"WARNING: {name} has no gradient!")
+            else:
+                has_nan = torch.isnan(param.grad).any().item()
+                max_grad = param.grad.abs().max().item()
+                if "projection" in name or name == "temperature":
+                    print(f"{name}: grad exists=True, has NaN={has_nan}, max={max_grad:.5f}")
+    
+    # 3. Inspect intermediate values
+    print("\n=== Inspecting intermediate values ===")
     model.eval()
     with torch.no_grad():
-        av_sims = model.forward_audio_visual(dummy_frames, dummy_audio)
-        print(f"Audio-Visual similarities shape: {av_sims.shape}")  
-        # expected => (B, Na, Nv)
-        tv_sims, tv_mask = model.forward_text_visual(dummy_frames, dummy_texts)
-        print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
-        # expected => (B, Nt, Nv), (B, Nt)
+        # Audio-visual path
+        visual_feats = model.visual_embedder(dummy_frames)
+        audio_feats = model.audio_embedder(dummy_audio)
+        
+        # Get raw token similarities
+        token_sims_av = torch.matmul(audio_feats.unsqueeze(1).expand(-1, batch_size, -1, -1), 
+                              visual_feats.unsqueeze(0).expand(batch_size, -1, -1, -1).transpose(2, 3)) / model.temperature
+        
+        # Get max similarities
+        max_sims_av = torch.max(token_sims_av, dim=3)[0]
+        
+        # Calculate z-scores
+        mean_sim_av = max_sims_av.mean(dim=2, keepdim=True)
+        std_sim_av = torch.std(max_sims_av, dim=2, keepdim=True).clamp(min=1e-5)
+        z_scores_av = (max_sims_av - mean_sim_av) / std_sim_av
+        
+        # Check relevance mask
+        relevance_mask_av = (z_scores_av > 0).float()
+        relevant_tokens_pct = relevance_mask_av.mean(dim=2).mean().item() * 100
+        
+        print(f"Audio path: {relevant_tokens_pct:.1f}% of tokens are considered relevant")
+        print(f"Z-score min: {z_scores_av.min().item():.2f}, max: {z_scores_av.max().item():.2f}")
+        
+        # Text-visual path
+        text_feats, attention_mask = model.text_embedder(dummy_texts)
+        
+        # Run a forward pass but extract intermediate results
+        clip_sims, token_sims_tv = model.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
+        
+        print(f"Text-visual clip similarities shape: {clip_sims.shape}")
+        print(f"Diagonal similarities (positive pairs): {clip_sims.diag()}")
+        
+    # 4. Compare with original pooling
+    print("\n=== Comparing with original pooling ===")
+    # Original audio-visual pooling (max-mean)
+    original_clip_sims_av = torch.mean(max_sims_av, dim=2)
     
-    print("MultiModalModel test completed.")
+    # Get diagonal values (positive pairs)
+    original_diag_av = original_clip_sims_av.diag()
+    new_diag_av = clip_sims.diag()
+    
+    print(f"Audio-Visual original diag: {original_diag_av}")
+    print(f"Text-Visual with relevance diag: {new_diag_av}")
+    print(f"Difference: {(new_diag_av - original_diag_av)}")
+    
+    print("\nMultiModalModel test completed.")

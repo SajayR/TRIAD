@@ -285,11 +285,11 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
+                wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
+            wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
+            wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -710,7 +710,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
-        output_dir="./outputs",
+        output_dir="./outputs_stats",
         batch_size_av=18,
         batch_size_tv=18,
         num_epochs=10,
