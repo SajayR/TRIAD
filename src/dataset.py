@@ -34,8 +34,11 @@ class LocalCaptionDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                               std=[0.229, 0.224, 0.225])
         ])
-        self.image_files = list(self.root_dir.rglob("*.jpg"))
-        
+        self.image_files = []
+        for subdir in self.root_dir.iterdir():
+            if subdir.is_dir():
+                self.image_files.extend(list(subdir.glob("*.jpg")))
+        print(f"Found {len(self.image_files)} images in {self.root_dir}")
     def __len__(self):
         return len(self.image_files)
     
@@ -168,7 +171,8 @@ class AudioVisualDataset(Dataset):
     def switch_segment(self):
         """Randomly switch to a different segment"""
         available_segments = list(self.segment_to_videos.keys())
-        available_segments.remove(self.current_segment)
+        if self.current_segment in available_segments:
+            available_segments.remove(self.current_segment)
         if available_segments:
             self.current_segment = random.choice(available_segments)
             self.video_files = self.segment_to_videos[self.current_segment]

@@ -671,7 +671,7 @@ if __name__ == "__main__":
 
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
-        text_dataset_path="/home/cis/cc3m",
+        text_dataset_path="/home/cis/cc3m-ironic",
         output_dir="./outputs",
         batch_size_av=18,
         batch_size_tv=18,
