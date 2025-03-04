@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-
+from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -275,6 +275,7 @@ class MultiModalTrainer:
         self.global_step = 0
         self.current_batch_idx = 0
         self.best_loss = float('inf')
+        
         print("Force new training: ", force_new_training)
         print("Use wandb: ", self.use_wandb)
         if self.use_wandb and not force_new_training:
@@ -284,19 +285,21 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, name="smooth", config=self.config)
+                wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="smooth", config=self.config)
+            wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="smooth", config=self.config)
-
-        print("Loaded checkpoint")
+            wandb.init(project=self.project_name, name="FinalFuck", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
         self.text_viz  = TextVisualizer()
         self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av)
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv)
+
+        print("Loaded checkpoint")
+
+        
 
         self.logger.info("Initialized MultiModalTrainer with multiple schedulers.")
 
@@ -373,9 +376,9 @@ class MultiModalTrainer:
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
         self.step_vit    = ck.get("sched_step_vit", 0)
-        self.start_epoch = ck["epoch"]+1
+        self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
-        self.current_batch_idx = 0 #ck.get("current_batch_idx", 0)
+        self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         self.av_dataset.current_segment = ck["current_segment"]
 
@@ -447,29 +450,64 @@ class MultiModalTrainer:
     #     Visualization logic
     ###########################################
     def _get_av_vis_samples(self, n_samples=2):
-        batch = next(iter(self.av_dataloader))
-        idxs = range(min(n_samples, len(batch['frame'])))
-
-        frames = batch['frame'][list(idxs)].cpu()
-        audio  = batch['audio'][list(idxs)].cpu()
-        video_paths = [batch['video_paths'][j] for j in idxs]
-
+        """Get clean samples for visualization without augmentation"""
+        batch_dataloader = DataLoader(
+            self.av_dataset, 
+            batch_size=n_samples, 
+            shuffle=True,
+            num_workers=1,
+            collate_fn=collate_fn
+        )
+        batch = next(iter(batch_dataloader))
+        
+        # Get the raw samples again but without augmentation
+        frames = []
+        audio = []
+        video_paths = []
+        
+        for i, video_path in enumerate(batch['video_paths']):
+            if i >= n_samples:
+                break
+                
+            sample = self.av_dataset.__getitem__(
+                self.av_dataset.video_files.index(Path(video_path)), 
+                apply_augmentation=False  # Important: no augmentation for viz
+            )
+            
+            frames.append(sample['video_frames'])
+            audio.append(sample['audio'])
+            video_paths.append(sample['video_path'])
+        
+        # Use the same padding logic as in the main collate_fn
+        max_audio_len = max(a.shape[0] for a in audio)
+        audio_padded = torch.zeros(len(audio), max_audio_len)
+        for i, a in enumerate(audio):
+            audio_len = a.shape[0]
+            audio_padded[i, :audio_len] = a
+        
         return {
-            "frames": frames,
-            "audio": audio,
+            "frames": torch.stack(frames),
+            "audio": audio_padded,  # Use padded audio
             "video_paths": video_paths
         }
 
     def _get_tv_vis_samples(self, n_samples=2):
         batch = next(iter(self.tv_dataloader))
-        images = batch['images']
-        captions = batch['captions']
-        idxs = range(min(n_samples, len(images)))
-        images = images[list(idxs)].cpu()
-        texts = [captions[i] for i in idxs]
+        # Instead of using batch images directly, get the original files
+        # and apply clean_transform
+        images = []
+        captions = []
+        for i in range(min(n_samples, len(batch['images']))):
+            img_path = self.tv_dataset.image_files[i]
+            img = Image.open(img_path).convert('RGB')
+            images.append(self.tv_dataset.clean_transform(img))
+            txt_path = img_path.with_suffix('.txt')
+            with open(txt_path, 'r') as f:
+                captions.append(f.read().strip())
+        
         return {
-            "images": images,
-            "texts": texts
+            "images": torch.stack(images),
+            "texts": captions
         }
 
     def visualize_samples(self, epoch):

@@ -29,11 +29,24 @@ class LocalCaptionDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
         self.root_dir = Path(root_dir)
         self.transform = transform or transforms.Compose([
-            transforms.Resize((224, 224), antialias=True),
+            # These augmentations work even with 224×224 images
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)), # Small translations
+            transforms.ToTensor(),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Random erasing for robustness
+            
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                            std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Clean transform for visualization
+        self.clean_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                              std=[0.229, 0.224, 0.225])
+                            std=[0.229, 0.224, 0.225])
         ])
+
         self.image_files = []
         for subdir in self.root_dir.iterdir():
             if subdir.is_dir():
@@ -57,6 +70,8 @@ class LocalCaptionDataset(Dataset):
             
         except Exception as e:
             print(f"Error loading {img_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()  # This will show the full stack trace
             return torch.zeros((3, 224, 224)), ""
 
 
@@ -90,7 +105,7 @@ def extract_audio_from_video(video_path: Path) -> torch.Tensor:
             container.close()
 
 
-def load_and_preprocess_video(video_path: str, sample_fps: int) -> torch.Tensor:
+def load_and_preprocess_video(video_path: str, sample_fps: int, apply_augmentation=True) -> torch.Tensor:
     """Load only one random frame from the 1s video using PyAV, resize, and normalize."""
     container = av.open(video_path)
     video_stream = container.streams.video[0]
@@ -120,9 +135,46 @@ def load_and_preprocess_video(video_path: str, sample_fps: int) -> torch.Tensor:
         raise ValueError(f"Failed to find appropriate frame for index {chosen_index}")
     decoded_frame = closest_frame.to_rgb().to_ndarray()
     frame_tensor = torch.from_numpy(decoded_frame).permute(2, 0, 1).float() / 255.0
+    
+    # Resize first to 256x256 to allow for random cropping
     frame_tensor = torch.nn.functional.interpolate(
-        frame_tensor.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False
+        frame_tensor.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
     ).squeeze(0)
+    
+    if apply_augmentation:
+        # Apply random augmentations
+        # Random crop
+        i, j, h, w = transforms.RandomCrop.get_params(frame_tensor, output_size=(224, 224))
+        frame_tensor = frame_tensor[:, i:i+h, j:j+w]
+        
+        # Random horizontal flip
+        if random.random() > 0.5:
+            frame_tensor = torch.flip(frame_tensor, [2])
+            
+        # Color jitter (manually applying since we're using tensors)
+        if random.random() > 0.5:
+            brightness = random.uniform(0.8, 1.2)
+            contrast = random.uniform(0.8, 1.2)
+            saturation = random.uniform(0.8, 1.2)
+            
+            # Apply brightness
+            frame_tensor = frame_tensor * brightness
+            
+            # Apply contrast
+            mean = torch.mean(frame_tensor, dim=[1, 2], keepdim=True)
+            frame_tensor = (frame_tensor - mean) * contrast + mean
+            
+            # Apply saturation (simplified)
+            grayscale = torch.mean(frame_tensor, dim=0, keepdim=True).repeat(3, 1, 1)
+            frame_tensor = frame_tensor * saturation + grayscale * (1 - saturation)
+    else:
+        # Simple center crop for visualization
+        frame_tensor = transforms.functional.center_crop(frame_tensor, (224, 224))
+    
+    # Clamp values to be in valid range [0, 1]
+    frame_tensor = torch.clamp(frame_tensor, 0, 1)
+    
+    # Apply normalization
     frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
     return frame_tensor
 
@@ -171,8 +223,7 @@ class AudioVisualDataset(Dataset):
     def switch_segment(self):
         """Randomly switch to a different segment"""
         available_segments = list(self.segment_to_videos.keys())
-        if self.current_segment in available_segments:
-            available_segments.remove(self.current_segment)
+        available_segments.remove(self.current_segment)
         if available_segments:
             self.current_segment = random.choice(available_segments)
             self.video_files = self.segment_to_videos[self.current_segment]
@@ -181,7 +232,8 @@ class AudioVisualDataset(Dataset):
     def __len__(self):
         return len(self.video_files)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, apply_augmentation=True):
+        """Get dataset item with option to apply augmentation"""
         video_path = self.video_files[idx]
         try: 
             audio = extract_audio_from_video(video_path)
@@ -190,7 +242,7 @@ class AudioVisualDataset(Dataset):
             audio = torch.zeros(16331)
             
         try:
-            video_frame = load_and_preprocess_video(str(video_path), self.sample_fps)
+            video_frame = load_and_preprocess_video(str(video_path), self.sample_fps, apply_augmentation=apply_augmentation)
         except Exception as e:
             print(f"Error processing {video_path} video frame: {str(e)}")
             video_frame = torch.zeros(3, 224, 224)
