@@ -228,7 +228,17 @@ class MultiModalModel(nn.Module):
         token_count = relevance_mask.sum(dim=2).clamp(min=1)  # (B, B)
         clip_sims = weighted_sum / token_count  # (B, B)
         
-        return clip_sims, token_sims
+        # Compute statistics for monitoring
+        stats = {
+            'av_relevant_tokens_pct': relevance_mask.mean().item() * 100,
+            'av_z_score_min': z_scores.min().item(),
+            'av_z_score_max': z_scores.max().item(),
+            'av_z_score_mean': z_scores.mean().item(),
+            # Focus on diagonal (positive pairs)
+            'av_pos_relevant_pct': torch.stack([relevance_mask[i,i].mean() for i in range(B)]).mean().item() * 100
+        }
+        
+        return clip_sims, token_sims, stats
 
     def compute_temporal_smoothness_loss(self, token_sims):
         """
@@ -268,7 +278,7 @@ class MultiModalModel(nn.Module):
         reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)# + 0.1 * l_smooth)
         return reg_loss
 
-    def compute_contrastive_loss_av(self, clip_sims, token_sims):
+    def compute_contrastive_loss_av(self, clip_sims, token_sims, stats):
         """
         InfoNCE-style cross-entropy for audio<->visual + regularizations.
         """
@@ -283,7 +293,7 @@ class MultiModalModel(nn.Module):
 
         contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
         reg_loss = self.compute_regularization_losses_av(token_sims)
-        return contrastive_loss + reg_loss
+        return contrastive_loss + reg_loss, stats
 
     def forward_audio_visual(self, frames, audio):
         """
@@ -297,8 +307,8 @@ class MultiModalModel(nn.Module):
         visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
         audio_feats = self.audio_embedder(audio)         # (B, Na, D)
         if self.training:
-            clip_sims, token_sims = self.compute_all_similarities_av(audio_feats, visual_feats)
-            return self.compute_contrastive_loss_av(clip_sims, token_sims)
+            clip_sims, token_sims, stats = self.compute_all_similarities_av(audio_feats, visual_feats)
+            return self.compute_contrastive_loss_av(clip_sims, token_sims, stats)
         else:
             # shape => (B, Na, Nv)
             token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
@@ -326,7 +336,7 @@ class MultiModalModel(nn.Module):
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)  # (B, B, Nv, D)
         
-        # Compute token-level similarities
+        # Token-level similarities
         token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature  # (B, B, Nt, Nv)
         
         # Max over visual dimension
@@ -335,40 +345,47 @@ class MultiModalModel(nn.Module):
         # Expand attention mask to match shape
         attn_mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)  # (B, B, Nt)
         
-        # Compute z-scores for statistical significance (within attention mask)
-        # We need to calculate mean and std only over valid tokens
-        masked_max_sims = max_sims * attn_mask  # Only consider valid tokens
+        # Compute z-scores (only for valid tokens)
+        masked_max_sims = max_sims * attn_mask
+        sum_sims = masked_max_sims.sum(dim=2, keepdim=True)
+        valid_count = attn_mask.sum(dim=2, keepdim=True).clamp(min=1e-7)
+        mean_sim = sum_sims / valid_count
         
-        # Sum of valid similarities
-        sum_sims = masked_max_sims.sum(dim=2, keepdim=True)  # (B, B, 1)
-        # Count of valid tokens
-        valid_count = attn_mask.sum(dim=2, keepdim=True).clamp(min=1e-7)  # (B, B, 1)
-        # Mean of valid similarities
-        mean_sim = sum_sims / valid_count  # (B, B, 1)
+        squared_diff = ((masked_max_sims - mean_sim) * attn_mask) ** 2
+        variance = squared_diff.sum(dim=2, keepdim=True) / valid_count.clamp(min=1)
+        std_sim = torch.sqrt(variance).clamp(min=1e-5)
         
-        # Calculate variance
-        squared_diff = ((masked_max_sims - mean_sim) * attn_mask) ** 2  # (B, B, Nt)
-        variance = squared_diff.sum(dim=2, keepdim=True) / valid_count.clamp(min=1)  # (B, B, 1)
-        std_sim = torch.sqrt(variance).clamp(min=1e-5)  # (B, B, 1)
-        
-        # Compute z-scores
-        z_scores = (max_sims - mean_sim) / std_sim  # (B, B, Nt)
+        z_scores = (max_sims - mean_sim) / std_sim
         
         # Combined mask: token must be valid (attention_mask) AND statistically relevant (z_score > 0)
-        relevance_mask = attn_mask * (z_scores > 0).float()  # (B, B, Nt)
+        relevance_mask = attn_mask * (z_scores > 0).float()
         
         # Ensure we have at least one relevant token per pair
-        # If a row in relevance_mask is all zeros, fall back to just using the attention mask
-        has_relevant = relevance_mask.sum(dim=2) > 0  # (B, B)
-        fallback_mask = ~has_relevant.unsqueeze(2) * attn_mask  # (B, B, Nt) 
-        final_mask = relevance_mask + fallback_mask  # (B, B, Nt)
+        has_relevant = relevance_mask.sum(dim=2) > 0
+        fallback_mask = ~has_relevant.unsqueeze(2) * attn_mask
+        final_mask = relevance_mask + fallback_mask
         
         # Compute weighted average
-        weighted_sum = (max_sims * final_mask).sum(dim=2)  # (B, B)
-        token_count = final_mask.sum(dim=2).clamp(min=1)  # (B, B)
-        clip_sims = weighted_sum / token_count  # (B, B)
+        weighted_sum = (max_sims * final_mask).sum(dim=2)
+        token_count = final_mask.sum(dim=2).clamp(min=1)
+        clip_sims = weighted_sum / token_count
         
-        return clip_sims, token_sims
+        # Compute statistics for monitoring
+        # Focusing only on valid tokens (where attention_mask is 1)
+        valid_tokens = attn_mask.sum().item()
+        relevance_tokens = relevance_mask.sum().item()
+        
+        stats = {
+            'tv_relevant_tokens_pct': (relevance_tokens / valid_tokens) * 100 if valid_tokens > 0 else 0,
+            'tv_z_score_min': z_scores[attn_mask > 0].min().item() if torch.any(attn_mask > 0) else 0,
+            'tv_z_score_max': z_scores[attn_mask > 0].max().item() if torch.any(attn_mask > 0) else 0,
+            'tv_z_score_mean': (z_scores * attn_mask).sum().item() / valid_tokens if valid_tokens > 0 else 0,
+            # Focus on diagonal (positive pairs)
+            'tv_pos_relevant_pct': torch.stack([(relevance_mask[i,i] * attn_mask[i,i]).sum() / 
+                                            attn_mask[i,i].sum().clamp(min=1) for i in range(B)]).mean().item() * 100
+        }
+        
+        return clip_sims, token_sims, stats
 
     def compute_regularization_losses_tv(self, token_sims):
         """
@@ -395,10 +412,10 @@ class MultiModalModel(nn.Module):
         # penalize if fraction > threshold
         excess = F.relu(patch_fraction - self.patch_sparsity_threshold)  # (B, Nv)
         loss_sparsity = (excess ** 2).mean()
-        reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
+        reg_loss = 8.0 * l_nonneg# + self.patch_sparsity_weight * loss_sparsity
         return reg_loss
 
-    def compute_contrastive_loss_tv(self, clip_sims, token_sims):
+    def compute_contrastive_loss_tv(self, clip_sims, token_sims, stats):
         """
         Standard cross-entropy for text<->visual plus the reg losses.
         """
@@ -417,7 +434,7 @@ class MultiModalModel(nn.Module):
         reg_loss = self.compute_regularization_losses_tv(token_sims)
 
         total_loss = contrastive_loss + reg_loss
-        return total_loss
+        return total_loss, stats
 
     def forward_text_visual(self, frames, text_list):
         """
@@ -431,8 +448,8 @@ class MultiModalModel(nn.Module):
         text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
 
         if self.training:
-            clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
+            clip_sims, token_sims, stats = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
+            return self.compute_contrastive_loss_tv(clip_sims, token_sims, stats)
         else:
             sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
             return sim_matrix, attention_mask

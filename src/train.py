@@ -616,9 +616,10 @@ class MultiModalTrainer:
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv  = tv_batch['captions']
                 self.model.train()
-                loss_av = self.model.forward_audio_visual(frames_av, audio_av)
-                loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
-                loss_total = loss_av + loss_tv
+                av_loss, av_stats = self.model.forward_audio_visual(frames_av, audio_av)
+                tv_loss, tv_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+
+                loss_total = av_loss + tv_loss
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
                 accumulation_counter += 1
@@ -671,8 +672,8 @@ class MultiModalTrainer:
                 if self.use_wandb:
                     wandb_dict = {
                         "train_loss": loss_val,
-                        "loss_av": loss_av.item(),
-                        "loss_tv": loss_tv.item(),
+                        "loss_av": av_loss.item(),
+                        "loss_tv": tv_loss.item(),
                         "epoch": epoch,
                         "global_step": self.global_step,
                         "lr_others": self.opt_others.param_groups[0]['lr'],
@@ -680,6 +681,8 @@ class MultiModalTrainer:
                         "lr_text":   self.opt_text.param_groups[0]['lr'],
                         "lr_vit":    self.opt_vit.param_groups[0]['lr'],
                     }
+                    wandb_dict.update(av_stats)
+                    wandb_dict.update(tv_stats)
                     wandb.log(wandb_dict)
 
                 del frames_av, audio_av, frames_tv, texts_tv, loss_total
@@ -711,8 +714,8 @@ if __name__ == "__main__":
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
         output_dir="./outputs_stats",
-        batch_size_av=18,
-        batch_size_tv=18,
+        batch_size_av=15,
+        batch_size_tv=15,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
@@ -721,13 +724,13 @@ if __name__ == "__main__":
         save_every_steps=5000,
         num_workers=8,
         device="cuda",
-        gradient_accumulation_steps=3,
+        gradient_accumulation_steps=4,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
         project_name="Triad",
-        num_vis_samples_av=18,
-        num_vis_samples_tv=18,
+        num_vis_samples_av=15,
+        num_vis_samples_tv=15,
     )
 
     trainer.train()
