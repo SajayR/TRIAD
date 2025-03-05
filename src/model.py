@@ -12,6 +12,7 @@ from transformers import (
 warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
+from torch.cuda.amp import autocast
 #################################################################
 #                   Audio Embedder
 #################################################################
@@ -160,7 +161,8 @@ class MultiModalModel(nn.Module):
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
-        visual_dropout_prob=0.1
+        visual_dropout_prob=0.1,
+        use_autocast=False
     ):
         super().__init__()
 
@@ -173,6 +175,8 @@ class MultiModalModel(nn.Module):
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
+        self.use_amp = use_autocast
+        self.amp_dtype = torch.bfloat16 
 
     ######################################################
     #               Shared Utilities
@@ -183,11 +187,14 @@ class MultiModalModel(nn.Module):
         feats1: (B, N1, D)
         feats2: (B, N2, D)
         Returns sim: (B, N1, N2)
+        Always run in full precision.
         """
+
+        with torch.cuda.amp.autocast(enabled=False):
         # feats1 = F.normalize(feats1, dim=-1)
         # feats2 = F.normalize(feats2, dim=-1)
-        sim = torch.bmm(feats1, feats2.transpose(1, 2))
-        return sim / self.temperature
+            sim = torch.bmm(feats1, feats2.transpose(1, 2))
+            return sim / self.temperature
 
     ######################################################
     #               AUDIO-VISUAL PATH
@@ -304,15 +311,19 @@ class MultiModalModel(nn.Module):
         If eval: returns token_sims
         """
         #print(audio.shape)
-        visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
-        audio_feats = self.audio_embedder(audio)         # (B, Na, D)
-        if self.training:
-            clip_sims, token_sims, stats = self.compute_all_similarities_av(audio_feats, visual_feats)
-            return self.compute_contrastive_loss_av(clip_sims, token_sims, stats)
-        else:
-            # shape => (B, Na, Nv)
-            token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
-            return token_sims
+        
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            visual_feats = self.visual_embedder(frames) # (B, Nv, D)
+            audio_feats = self.audio_embedder(audio)   # (B, Na, D)
+
+        with torch.cuda.amp.autocast(enabled=False):
+            if self.training:
+                clip_sims, token_sims, stats = self.compute_all_similarities_av(audio_feats, visual_feats)
+                return self.compute_contrastive_loss_av(clip_sims, token_sims, stats)
+            else:
+                # shape => (B, Na, Nv)
+                token_sims = self.compute_similarity_matrix(audio_feats, visual_feats)
+                return token_sims
 
 
     ######################################################
@@ -444,15 +455,18 @@ class MultiModalModel(nn.Module):
         If training: return scalar contrastive loss
         else: return (sim_matrix, attention_mask)
         """
-        visual_feats = self.visual_embedder(frames)               # (B, Nv, D)
-        text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
+        
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            visual_feats = self.visual_embedder(frames) # (B, Nv, D)
+            text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
 
-        if self.training:
-            clip_sims, token_sims, stats = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims, stats)
-        else:
-            sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
-            return sim_matrix, attention_mask
+        with torch.cuda.amp.autocast(enabled=False):
+            if self.training:
+                clip_sims, token_sims, stats = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
+                return self.compute_contrastive_loss_tv(clip_sims, token_sims, stats)
+            else:
+                sim_matrix = self.compute_similarity_matrix(text_feats, visual_feats)  # (B, Nt, Nv)
+                return sim_matrix, attention_mask
 
     def forward(self, frames=None, audio=None, text_list=None):
         assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"

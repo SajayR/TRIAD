@@ -81,7 +81,8 @@ class MultiModalTrainer:
         save_every_steps: int = 10000,
         num_workers: int = 4,
         device: str = "cuda",
-        force_new_training: bool = False
+        force_new_training: bool = False,
+        use_autocast: bool = False
     ):
         """
         Args:
@@ -112,8 +113,11 @@ class MultiModalTrainer:
             "unfreeze_text_step": unfreeze_text_step,
             "unfreeze_vit_step": unfreeze_vit_step,
             "vis_every": vis_every,
-            "save_every_steps": save_every_steps
+            "save_every_steps": save_every_steps,
+            "use_autocast": use_autocast
         }
+        self.use_amp = use_autocast
+        self.amp_dtype = torch.bfloat16
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
             level=logging.INFO,
@@ -166,7 +170,8 @@ class MultiModalTrainer:
             temperature=2.0,
             patch_sparsity_threshold=0.3,
             patch_sparsity_weight=0.1,
-            visual_dropout_prob=0.1
+            visual_dropout_prob=0.1,
+            use_autocast=use_autocast
         ).to(self.device)
 
         # -----------------------------------------------------
@@ -285,11 +290,11 @@ class MultiModalTrainer:
             if ckpt:
                 self.load_checkpoint(ckpt)
             else:
-                wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
+                wandb.init(project=self.project_name, name="stats had sex with bf16", config=self.config)
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
+            wandb.init(project=self.project_name, name="stats had sex with bf16", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="I guess not, stats time bitch", config=self.config)
+            wandb.init(project=self.project_name, name="stats had sex with bf16", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -714,8 +719,8 @@ if __name__ == "__main__":
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
         output_dir="./outputs_stats",
-        batch_size_av=15,
-        batch_size_tv=15,
+        batch_size_av=24,
+        batch_size_tv=24,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
@@ -724,13 +729,14 @@ if __name__ == "__main__":
         save_every_steps=5000,
         num_workers=8,
         device="cuda",
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=3,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
         project_name="Triad",
-        num_vis_samples_av=15,
-        num_vis_samples_tv=15,
+        num_vis_samples_av=24,
+        num_vis_samples_tv=24,
+        use_autocast=True,
     )
 
     trainer.train()
