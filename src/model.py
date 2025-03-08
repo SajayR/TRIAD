@@ -187,8 +187,8 @@ class MultiModalModel(nn.Module):
         feats2: (B, N2, D)
         Returns sim: (B, N1, N2)
         """
-        # feats1 = F.normalize(feats1, dim=-1)
-        # feats2 = F.normalize(feats2, dim=-1)
+        feats1 = F.normalize(feats1, dim=-1)
+        feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -244,20 +244,20 @@ class MultiModalModel(nn.Module):
           2. Temperature constraints (optional if you're using a trainable temperature)
         """
         # 1) Non-negative pressure
-        neg_sims = torch.clamp(token_sims, min=-20, max=0)
-        l_nonneg = torch.mean(neg_sims ** 4)
+        neg_sims = torch.clamp(token_sims, min=-60, max=0)
+        l_nonneg = torch.mean(neg_sims ** 2)
 
         # 2) Temperature calibration
         #    force it between [1,4] or sumn man idk.
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
-                               - torch.log(self.temperature), min=0) ** 4
+                               - torch.log(self.temperature), min=0) ** 2
         temp_high = torch.clamp(torch.log(self.temperature) 
-                                - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 4
+                                - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 2
         l_cal = temp_low + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (8.0 * l_cal + 0.15 * l_nonneg)# + 0.1 * l_smooth)
-        return reg_loss
+        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.1 * l_smooth)
+        return reg_loss, 0.05*l_smooth
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
         """
@@ -273,8 +273,11 @@ class MultiModalModel(nn.Module):
         losses_v2a = -log_prob_v2a[torch.arange(B), labels]
 
         contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
-        reg_loss = self.compute_regularization_losses_av(token_sims)
-        return contrastive_loss + reg_loss
+        reg_loss, l_smooth = self.compute_regularization_losses_av(token_sims)
+        #print(f"l_smooth: {l_smooth}")
+        #print(f"contrastive_loss: {contrastive_loss}")
+        #print(f"reg_loss: {reg_loss}")
+        return contrastive_loss + reg_loss, contrastive_loss, reg_loss, l_smooth
 
     def forward_audio_visual(self, frames, audio):
         """
@@ -400,7 +403,7 @@ class MultiModalModel(nn.Module):
     def forward(self, frames=None, audio=None, text_list=None):
         assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"
         # we need to conver the image into the correct format and shit
-        assert frames is not str, "Frames should be a path to an image"
+        assert frames is not str, "Frames Cross-modal retrieval using 1000 evaluation videos from the PlacesAudio and AudioSet validation datasets. DenseAV dramatically outperforms all approaches tested in all metrics. Most notably, the state-of-the-art image retrieval foundation model, ImageBind, is incapable of recognizing speech. We note that the ImageBind authors do not publish retraining code, so we evaluate their largest pretrained model. Models with a * indicate that they have been previously reported in the literature. Other numbers are calculated by using pretrained models when available or from training with the author’s official training scripts.should be a path to an image"
         if frames is not None:
             image = Image.open(frames).convert('RGB')
             transform = transforms.Compose([

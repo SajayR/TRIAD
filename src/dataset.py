@@ -251,8 +251,8 @@ class AudioVisualDataset(Dataset):
             'video_path': str(video_path),
             'video_frames': video_frame, 
             'audio': audio,
-            'vid_num': int(video_path.stem.split('_')[0]),
-            'segment_num': self.current_segment
+            #'vid_num': int(video_path.stem.split('_')[0]),
+            #'segment_num': self.current_segment
         }
         
 
@@ -267,8 +267,8 @@ def collate_fn(batch):
     return {
         'frame': video_tokens,
         'audio': audio_padded,
-        'vid_nums': [item['vid_num'] for item in batch],
-        'segment_nums': [item['segment_num'] for item in batch],
+        #'vid_nums': [item['vid_num'] for item in batch],
+        #'segment_nums': [item['segment_num'] for item in batch],
         'video_paths': [str(item['video_path']) for item in batch]
     }
 

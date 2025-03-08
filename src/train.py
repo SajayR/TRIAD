@@ -165,11 +165,15 @@ class MultiModalTrainer:
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=2.0,
-            patch_sparsity_threshold=0.3,
-            patch_sparsity_weight=0.1,
-            visual_dropout_prob=0.1,
+            patch_sparsity_threshold=0.7,
+            patch_sparsity_weight=0.7,
+            visual_dropout_prob=0.05,
             use_amp=use_amp
         ).to(self.device)
+        #enabling gradient checkpointing
+        #self.model.audio_embedder.hubert.gradient_checkpointing_enable()
+        #self.model.text_embedder.encoder.gradient_checkpointing_enable()
+        #1self.model.visual_embedder.model.gradient_checkpointing = True
 
         # -----------------------------------------------------
         #  3) Separate param groups => separate optimizers
@@ -280,18 +284,19 @@ class MultiModalTrainer:
         
         print("Force new training: ", force_new_training)
         print("Use wandb: ", self.use_wandb)
-        if self.use_wandb and not force_new_training:
+        if not force_new_training:
             print("Loading checkpoint")
             ckpt = self.find_latest_checkpoint()
             print("Checkpoint found: ", ckpt)
             if ckpt:
                 self.load_checkpoint(ckpt)
-            else:
-                wandb.init(project=self.project_name, name="classic-bf16", config=self.config)
+                print("Checkpoint loaded")
+            elif self.use_wandb:
+                print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="classic-bf16", config=self.config)
+            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="classic-bf16", config=self.config)
+            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -299,7 +304,10 @@ class MultiModalTrainer:
         self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av)
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv)
 
-        print("Loaded checkpoint")
+    
+
+        print("Compiling model")
+        self.model = torch.compile(self.model, mode="max-autotune")
 
         
 
@@ -340,7 +348,7 @@ class MultiModalTrainer:
             "current_batch_idx": self.current_batch_idx,
             "current_segment": self.av_dataset.current_segment,
             "rng_state": rng_state,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self.model._orig_mod.state_dict(),
             "opt_others_state": self.opt_others.state_dict(),
             "opt_audio_state":  self.opt_audio.state_dict(),
             "opt_text_state":   self.opt_text.state_dict(),
@@ -364,8 +372,21 @@ class MultiModalTrainer:
     def load_checkpoint(self, ckpt_path):
         self.logger.info(f"Loading checkpoint from {ckpt_path}")
         ck = torch.load(ckpt_path, map_location=self.device)
-
-        self.model.load_state_dict(ck["model_state_dict"])
+        #adding cross compatibility with both checkpoints with orig_mod and without
+        if "_orig_mod." in list(ck["model_state_dict"].keys())[0]:
+            print("Checkpoint with _orig_mod. found")
+            state_dict = ck["model_state_dict"]
+            clean_state_dict = {}
+            clean_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith('_orig_mod.'):
+                    clean_key = key[len('_orig_mod.'):]
+                    clean_state_dict[clean_key] = value
+                else:
+                    clean_state_dict[key] = value
+            self.model.load_state_dict(clean_state_dict)
+        else:
+            self.model.load_state_dict(ck["model_state_dict"])
         self.opt_others.load_state_dict(ck["opt_others_state"])
         self.opt_audio.load_state_dict(ck["opt_audio_state"])
         self.opt_text.load_state_dict(ck["opt_text_state"])
@@ -428,7 +449,6 @@ class MultiModalTrainer:
         else:
             for p in audio_module.parameters():
                 p.requires_grad = True
-
         # Text
         text_module = self.model.text_embedder.encoder
         if current_step < self.config['unfreeze_text_step']:
@@ -606,6 +626,7 @@ class MultiModalTrainer:
                 try:
                     av_batch = next(self.av_iter)
                 except StopIteration:
+                    print("StopIteration in av_iter")
                     self.av_iter = iter(self.av_dataloader)
                     av_batch = next(self.av_iter)
                 frames_av = av_batch['frame'].to(self.device)
@@ -613,12 +634,13 @@ class MultiModalTrainer:
                 try:
                     tv_batch = next(self.tv_iter)
                 except StopIteration:
+                    print("StopIteration in tv_iter")
                     self.tv_iter = iter(self.tv_dataloader)
                     tv_batch = next(self.tv_iter)
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv  = tv_batch['captions']
                 self.model.train()
-                loss_av = self.model.forward_audio_visual(frames_av, audio_av)
+                loss_av, av_contrastive, av_reg, av_smooth = self.model.forward_audio_visual(frames_av, audio_av)
                 loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
                 loss_total = loss_av + loss_tv
                 loss_scaled = loss_total / self.gradient_accumulation_steps
@@ -681,6 +703,10 @@ class MultiModalTrainer:
                         "lr_audio":  self.opt_audio.param_groups[0]['lr'],
                         "lr_text":   self.opt_text.param_groups[0]['lr'],
                         "lr_vit":    self.opt_vit.param_groups[0]['lr'],
+                        "av_contrastive_loss": av_contrastive.item(),
+                        "av_reg_loss": av_reg.item(),
+                        "av_smooth_loss": av_smooth.item(),
+                        "temperature": self.model.temperature.item()
                     }
                     wandb.log(wandb_dict)
 
@@ -712,7 +738,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
-        output_dir="./outputs",
+        output_dir="./outputs-norm",
         batch_size_av=24,
         batch_size_tv=24,
         num_epochs=10,
@@ -724,9 +750,9 @@ if __name__ == "__main__":
         num_workers=8,
         device="cuda",
         gradient_accumulation_steps=3,
-        unfreeze_audio_step=5000,
-        unfreeze_text_step=5000,
-        unfreeze_vit_step=5000,
+        unfreeze_audio_step=0,
+        unfreeze_text_step=0,
+        unfreeze_vit_step=0,
         project_name="Triad",
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
