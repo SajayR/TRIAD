@@ -12,7 +12,11 @@ from transformers import (
 warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
+<<<<<<< HEAD
 
+=======
+from torch.cuda.amp import autocast
+>>>>>>> f43f631 (updates to model and training)
 from peft import (
     LoraConfig, 
     get_peft_model,
@@ -181,6 +185,76 @@ class ViTLoRAEmbedder(nn.Module):
         feats = self.dropout(feats)
         
         return feats
+    
+
+#################################################################
+#                   Vision-Encoder(LORA) Model
+#################################################################
+
+class ViTLoRAEmbedder(nn.Module):
+    """
+    DINOv2 with LoRA adapters for parameter-efficient fine-tuning.
+    Projects output embeddings to a common dimension with a linear layer.
+    """
+    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
+                 embedding_dim=512, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
+        super().__init__()
+        
+        # Load the base model
+        self.model = torch.hub.load(model_name, arch)
+        print(f"Using DINOv2 model with LoRA adapters: {arch}")
+        
+        # Freeze the base model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # Define which attention layers to apply LoRA to
+        # Based on our understanding of the model architecture
+        target_modules = ["attn.qkv", "attn.proj"]
+        
+        # LoRA configuration
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            inference_mode=False,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=dropout_prob,
+        )
+        
+        # Apply LoRA to the model
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # Print trainable parameters to confirm LoRA setup
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"ViT with LoRA - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
+        
+        # Add a projection layer to match the expected embedding dimension
+        self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 3, H, W), e.g. (B,3,224,224) image batch
+        Returns:
+            visual_feats: (B, Nv, D)
+                Nv = number of visual tokens
+                D  = embedding_dim
+        """
+        if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
+            x = x.squeeze(0)  # get [1, 3, 224, 224]
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
+            
+        # Use intermediate layers for feature extraction - same as original
+        patches = self.model.get_intermediate_layers(x, n=1)[0]
+        feats = self.projection(patches)
+        feats = self.dropout(feats)
+        
+        return feats
+
 
 
 #################################################################
@@ -202,6 +276,7 @@ class MultiModalModel(nn.Module):
 
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
+<<<<<<< HEAD
         self.visual_embedder = ViTLoRAEmbedder(
             arch='dinov2_vitb14',
             embedding_dim=512,
@@ -209,6 +284,16 @@ class MultiModalModel(nn.Module):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha
         )
+=======
+        #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14',
+        #                                   embedding_dim=512,
+        #                                   dropout_prob=visual_dropout_prob)
+        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14',
+                                              embedding_dim=512,
+                                              dropout_prob=visual_dropout_prob,
+                                              lora_rank=16,
+                                              lora_alpha=32)
+>>>>>>> f43f631 (updates to model and training)
 
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold

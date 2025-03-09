@@ -176,10 +176,16 @@ class MultiModalTrainer:
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         audio_params = []
+<<<<<<< HEAD
         text_params = []
         vit_lora_params = []
         others_params = []
 
+=======
+        text_params  = []
+        vit_lora_params   = []
+        others_params= []
+>>>>>>> f43f631 (updates to model and training)
         for name, param in self.model.named_parameters():
             if "audio_embedder.hubert" in name:
                 audio_params.append(param)
@@ -270,12 +276,20 @@ class MultiModalTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
+<<<<<<< HEAD
+=======
+        
+>>>>>>> f43f631 (updates to model and training)
 
         # Local step counters for each scheduler
         self.step_others = 0
         self.step_audio  = 0
         self.step_text   = 0
+<<<<<<< HEAD
         self.step_lora = 0
+=======
+        self.step_lora    = 0
+>>>>>>> f43f631 (updates to model and training)
 
         # -----------------------------------------------------
         #  5) State tracking & optional resume
@@ -295,11 +309,17 @@ class MultiModalTrainer:
             else:
                 wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
         elif self.use_wandb and force_new_training:
+<<<<<<< HEAD
             wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, name="triad-lora-actual", config=self.config)
 
         print("Loaded checkpoint")
+=======
+            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm-lora", config=self.config)
+        if self.use_wandb and wandb.run is None:
+            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm-lora", config=self.config)
+>>>>>>> f43f631 (updates to model and training)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -381,7 +401,11 @@ class MultiModalTrainer:
         self.step_others = ck.get("sched_step_others", 0)
         self.step_audio  = ck.get("sched_step_audio", 0)
         self.step_text   = ck.get("sched_step_text", 0)
+<<<<<<< HEAD
         self.step_lora = ck.get("sched_step_lora", 0)
+=======
+        self.step_lora    = ck.get("sched_step_lora", 0)
+>>>>>>> f43f631 (updates to model and training)
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
@@ -552,6 +576,11 @@ class MultiModalTrainer:
             self.av_iter = iter(self.av_dataloader)
             self.tv_iter = iter(self.tv_dataloader)
 
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            self.logger.info(f"Total parameters: {total_params:,}")
+            self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params:.2%})")
+
             # If resuming in the middle of an epoch
             print(f"Resuming from batch {self.current_batch_idx}")
             for _ in tqdm(range(self.current_batch_idx), desc="Resuming from checkpoint"):
@@ -633,7 +662,10 @@ class MultiModalTrainer:
                     else:
                         self.opt_text.zero_grad()
 
+<<<<<<< HEAD
                     
+=======
+>>>>>>> f43f631 (updates to model and training)
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
                 pbar.set_postfix({"loss": f"{loss_val:.4f}"})
@@ -648,7 +680,15 @@ class MultiModalTrainer:
                         "lr_others": self.opt_others.param_groups[0]['lr'],
                         "lr_audio":  self.opt_audio.param_groups[0]['lr'],
                         "lr_text":   self.opt_text.param_groups[0]['lr'],
+<<<<<<< HEAD
                         "lr_lora": self.opt_lora.param_groups[0]['lr']
+=======
+                        "lr_lora":   self.opt_lora.param_groups[0]['lr'],
+                        "av_contrastive_loss": av_contrastive.item(),
+                        "av_reg_loss": av_reg.item(),
+                        "av_smooth_loss": av_smooth.item(),
+                        "temperature": self.model.temperature.item()
+>>>>>>> f43f631 (updates to model and training)
                     }
                     wandb.log(wandb_dict)
 
@@ -679,13 +719,20 @@ if __name__ == "__main__":
 
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
+<<<<<<< HEAD
         text_dataset_path="/home/cis/cc3m",
         output_dir="./outputs_lora",
         batch_size_av=26,
         batch_size_tv=26,
+=======
+        text_dataset_path="/home/cis/cc3m-ironic",
+        output_dir="./outputs-norm-lora",
+        batch_size_av=32,
+        batch_size_tv=32,
+>>>>>>> f43f631 (updates to model and training)
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=True,
+        use_wandb=False,
         force_new_training=False,
         vis_every=5000,
         save_every_steps=5000,
@@ -696,11 +743,17 @@ if __name__ == "__main__":
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
         project_name="Triad",
+<<<<<<< HEAD
         num_vis_samples_av=20,
         num_vis_samples_tv=20,
         lora_rank=8,
         lora_alpha=16
 
+=======
+        num_vis_samples_av=32,
+        num_vis_samples_tv=32,
+        use_amp=True
+>>>>>>> f43f631 (updates to model and training)
     )
 
     trainer.train()
