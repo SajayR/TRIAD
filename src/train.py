@@ -425,6 +425,7 @@ class MultiModalTrainer:
         self.vis_samples_av = ck["vis_samples_av"]
         self.vis_samples_tv = ck["vis_samples_tv"]
         self._update_frozen_params(self.global_step)
+        del ck
 
         self.logger.info(
             f"Checkpoint loaded (epoch={self.start_epoch}, step={self.global_step}, "
@@ -618,7 +619,7 @@ class MultiModalTrainer:
                     next(self.tv_iter)
 
             max_steps = max(len(self.av_dataloader), len(self.tv_dataloader))
-            pbar = tqdm(range(max_steps), desc=f"Epoch {epoch}")
+            pbar = tqdm(range(max_steps-self.current_batch_idx), desc=f"Epoch {epoch}")
             epoch_losses = []
 
             for batch_idx in pbar:
