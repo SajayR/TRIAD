@@ -165,8 +165,8 @@ class MultiModalTrainer:
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=2.0,
-            patch_sparsity_threshold=0.7,
-            patch_sparsity_weight=0.7,
+            patch_sparsity_threshold=1.5,
+            patch_sparsity_weight=0.5,
             visual_dropout_prob=0.05,
             use_amp=use_amp
         ).to(self.device)
@@ -294,9 +294,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-no-layer-norm", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="classic-bf16-smooth-norm", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-no-layer-norm", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -641,8 +641,8 @@ class MultiModalTrainer:
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv  = tv_batch['captions']
                 self.model.train()
-                loss_av, av_contrastive, av_reg, av_smooth = self.model.forward_audio_visual(frames_av, audio_av)
-                loss_tv = self.model.forward_text_visual(frames_tv, texts_tv)
+                loss_av, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
+                loss_tv, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
                 loss_total = loss_av + loss_tv
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
@@ -709,6 +709,9 @@ class MultiModalTrainer:
                         "av_smooth_loss": av_smooth.item(),
                         "temperature": self.model.temperature.item()
                     }
+
+                    wandb_dict.update(av_sim_stats)
+                    wandb_dict.update(tv_sim_stats)
                     wandb.log(wandb_dict)
 
                 del frames_av, audio_av, frames_tv, texts_tv, loss_total
@@ -739,9 +742,9 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
-        output_dir="./outputs-norm",
-        batch_size_av=24,
-        batch_size_tv=24,
+        output_dir="./outputs-no-layernorm-but-norm",
+        batch_size_av=22,
+        batch_size_tv=22,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
@@ -751,10 +754,10 @@ if __name__ == "__main__":
         num_workers=8,
         device="cuda",
         gradient_accumulation_steps=3,
-        unfreeze_audio_step=0,
-        unfreeze_text_step=0,
-        unfreeze_vit_step=0,
-        project_name="Triad",
+        unfreeze_audio_step=5000,
+        unfreeze_text_step=5000,
+        unfreeze_vit_step=5000,
+        project_name="TriadFudge",
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
         use_amp=True

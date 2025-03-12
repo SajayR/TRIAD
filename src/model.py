@@ -26,6 +26,7 @@ class AudioEmbedder(nn.Module):
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")  
         self.hubert = HubertModel.from_pretrained(hubert_name)
         self.projection = nn.Linear(self.hubert.config.hidden_size, embedding_dim)
+        #self.layer_norm = nn.LayerNorm(embedding_dim)
         
         for param in self.hubert.parameters():
             param.requires_grad = True
@@ -58,7 +59,7 @@ class AudioEmbedder(nn.Module):
         hubert_output = self.hubert(inputs).last_hidden_state  # (B, T', hidden_size)
         
         audio_feats = self.projection(hubert_output)  # (B, T', D)
-        
+        #audio_feats = self.layer_norm(audio_feats)
         return audio_feats
 
 
@@ -75,6 +76,7 @@ class TextEmbedder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
+        #self.layer_norm = nn.LayerNorm(embedding_dim)
         print("Using text model: ", model_name)
         
         for param in self.encoder.parameters():
@@ -106,7 +108,7 @@ class TextEmbedder(nn.Module):
         outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
         hidden_states = outputs.last_hidden_state
         text_feats = self.projection(hidden_states)  # (B, Nt, D)
-        
+        #text_feats = self.layer_norm(text_feats)
         return text_feats, inputs["attention_mask"]
 
 
@@ -124,7 +126,7 @@ class ViTEmbedder(nn.Module):
         self.model = torch.hub.load(model_name, arch)
         print("Using DINOv2 model: ", arch)
         self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
-        self.dropout = nn.Dropout(p=dropout_prob)
+        #self.layer_norm = nn.LayerNorm(embedding_dim)
 
         for param in self.model.parameters():
             param.requires_grad = True
@@ -145,8 +147,7 @@ class ViTEmbedder(nn.Module):
             x = x.unsqueeze(0)
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
         feats = self.projection(patches)
-        feats = self.dropout(feats)
-        
+        #feats = self.layer_norm(feats)
         return feats
 
 
@@ -211,6 +212,9 @@ class MultiModalModel(nn.Module):
         """
         B = audio_feats.shape[0]
         # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
+        audio_feats = F.normalize(audio_feats, dim=-1)
+        visual_feats = F.normalize(visual_feats, dim=-1)
+        
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         # dot product => (B, B, Na, Nv)
@@ -257,15 +261,31 @@ class MultiModalModel(nn.Module):
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
         reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.1 * l_smooth)
-        return reg_loss, 0.05*l_smooth
+        return reg_loss, 0.1*l_smooth
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
-        """
-        InfoNCE-style cross-entropy for audio<->visual + regularizations.
-        """
         B = clip_sims.shape[0]
         labels = torch.arange(B, device=clip_sims.device)
-
+        
+        # Extract positive and negative similarities
+        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+        
+        # Create a mask for negative pairs (all except diagonal)
+        mask = torch.ones_like(clip_sims, dtype=torch.bool)
+        mask.fill_diagonal_(0)
+        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        
+        # Compute statistics
+        pos_sim_mean = pos_sims.mean().item()
+        pos_sim_std = pos_sims.std().item()
+        neg_sim_mean = neg_sims.mean().item()
+        neg_sim_std = neg_sims.std().item()
+        hardest_negative = neg_sims.max().item()
+        
+        # Calculate separation (gap between positive and negative means)
+        separation = pos_sim_mean - neg_sim_mean
+        
+        # Original contrastive loss calculation
         log_prob_a2v = F.log_softmax(clip_sims, dim=1)
         losses_a2v = -log_prob_a2v[torch.arange(B), labels]
 
@@ -274,10 +294,18 @@ class MultiModalModel(nn.Module):
 
         contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
         reg_loss, l_smooth = self.compute_regularization_losses_av(token_sims)
-        #print(f"l_smooth: {l_smooth}")
-        #print(f"contrastive_loss: {contrastive_loss}")
-        #print(f"reg_loss: {reg_loss}")
-        return contrastive_loss + reg_loss, contrastive_loss, reg_loss, l_smooth
+        
+        # Return similarity stats along with losses
+        similarity_stats = {
+            "av_pos_sim_mean": pos_sim_mean,
+            "av_pos_sim_std": pos_sim_std,
+            "av_neg_sim_mean": neg_sim_mean,
+            "av_neg_sim_std": neg_sim_std,
+            "av_separation": separation,
+            "av_hardest_negative": hardest_negative
+        }
+        
+        return contrastive_loss + reg_loss, contrastive_loss, reg_loss, l_smooth, similarity_stats
 
     def forward_audio_visual(self, frames, audio):
         """
@@ -316,6 +344,9 @@ class MultiModalModel(nn.Module):
             token_sims: (B, B, Nt, Nv)
         """
         B = text_feats.shape[0]
+
+        text_feats = F.normalize(text_feats, dim=-1)
+        visual_feats = F.normalize(visual_feats, dim=-1)
 
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
@@ -362,11 +393,31 @@ class MultiModalModel(nn.Module):
 
     def compute_contrastive_loss_tv(self, clip_sims, token_sims):
         """
-        Standard cross-entropy for text<->visual plus the reg losses.
+        Standard cross-entropy for text<->visual plus the reg losses,
+        now with similarity statistics tracking.
         """
         B = clip_sims.shape[0]
         labels = torch.arange(B, device=clip_sims.device)
-
+        
+        # Extract positive and negative similarities
+        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+        
+        # Create a mask for negative pairs (all except diagonal)
+        mask = torch.ones_like(clip_sims, dtype=torch.bool)
+        mask.fill_diagonal_(0)
+        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        
+        # Compute statistics
+        pos_sim_mean = pos_sims.mean().item()
+        pos_sim_std = pos_sims.std().item()
+        neg_sim_mean = neg_sims.mean().item()
+        neg_sim_std = neg_sims.std().item()
+        hardest_negative = neg_sims.max().item()
+        
+        # Calculate separation (gap between positive and negative means)
+        separation = pos_sim_mean - neg_sim_mean
+        
+        # Original contrastive loss calculation
         # text->visual
         log_prob_t2v = F.log_softmax(clip_sims, dim=1)
         losses_t2v = -log_prob_t2v[torch.arange(B), labels]
@@ -379,7 +430,18 @@ class MultiModalModel(nn.Module):
         reg_loss = self.compute_regularization_losses_tv(token_sims)
 
         total_loss = contrastive_loss + reg_loss
-        return total_loss
+        
+        # Return similarity stats along with losses
+        similarity_stats = {
+            "tv_pos_sim_mean": pos_sim_mean,
+            "tv_pos_sim_std": pos_sim_std,
+            "tv_neg_sim_mean": neg_sim_mean,
+            "tv_neg_sim_std": neg_sim_std,
+            "tv_separation": separation,
+            "tv_hardest_negative": hardest_negative
+        }
+        
+        return total_loss, similarity_stats
 
     def forward_text_visual(self, frames, text_list):
         """
