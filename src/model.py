@@ -187,9 +187,10 @@ class MultiModalModel(nn.Module):
         feats1: (B, N1, D)
         feats2: (B, N2, D)
         Returns sim: (B, N1, N2)
-        """
-        feats1 = F.normalize(feats1, dim=-1)
-        feats2 = F.normalize(feats2, dim=-1)
+        """ 
+        # ONLY NORMALIZE DURING INFERENCE, TRAINING CAUSES MODEL COLLAPSE
+        #feats1 = F.normalize(feats1, dim=-1)
+        #feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -212,9 +213,6 @@ class MultiModalModel(nn.Module):
         """
         B = audio_feats.shape[0]
         # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
-        audio_feats = F.normalize(audio_feats, dim=-1)
-        visual_feats = F.normalize(visual_feats, dim=-1)
-        
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         # dot product => (B, B, Na, Nv)
@@ -344,10 +342,6 @@ class MultiModalModel(nn.Module):
             token_sims: (B, B, Nt, Nv)
         """
         B = text_feats.shape[0]
-
-        text_feats = F.normalize(text_feats, dim=-1)
-        visual_feats = F.normalize(visual_feats, dim=-1)
-
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
         # token-level similarity => (B, B, Nt, Nv)
