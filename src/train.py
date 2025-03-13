@@ -294,9 +294,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-no-layer-norm", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-webow", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-no-layer-norm", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-webow", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -707,7 +707,7 @@ class MultiModalTrainer:
                         "av_contrastive_loss": av_contrastive.item(),
                         "av_reg_loss": av_reg.item(),
                         "av_smooth_loss": av_smooth.item(),
-                        "temperature": self.model.temperature.item()
+                        "temperature": self.model.temperature.item(),
                     }
 
                     wandb_dict.update(av_sim_stats)
@@ -742,10 +742,10 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
-        output_dir="./outputs-no-layernorm-but-norm",
+        output_dir="./outputs-webow",
         batch_size_av=22,
         batch_size_tv=22,
-        num_epochs=10,
+        num_epochs=10,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
@@ -757,7 +757,7 @@ if __name__ == "__main__":
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
-        project_name="TriadFudge",
+        project_name="Triad",
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
         use_amp=True

@@ -1,8 +1,9 @@
 # Triad: Dense Cross-Modal Grounding
 
 Dense feature learning between video, audio, and text modalities. Built on HuBERT, DINOv2, and DistilBERT backbones with contrastive learning for localized feature alignment.
-
+![Feature grounding example](src/conts/image.png)
 This is a very early research project for dense multi-modal learning, with lots of room for improvement and experimentation. The current model was trained on a subset of AudioSet (~400k videos) and CC3M (~2M image-text pairs) for just one epoch, so while it shows promising behavior, it's definitely not state-of-the-art yet.
+
 ## What even are we doing?
 
 Unlike models like ImageBind that focus on global alignment between modalities, Triad learns fine-grained correspondences between specific regions in images/video and segments in audio/text. This means you can:
@@ -23,9 +24,6 @@ The model uses three specialized backbones:
 - Text: DistilBERT for textual understanding
 
 These feed into a shared cross-modal attention mechanism that learns to align features across modalities. The model is trained using contrastive learning, pushing corresponding features closer while separating unrelated ones with a max-mean pooling strategy for dense feature learning.
-
-## Examples 
-![Feature grounding example](src/conts/image.png)
 
 
 ## Acknowledgments

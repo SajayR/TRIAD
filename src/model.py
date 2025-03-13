@@ -9,6 +9,7 @@ from transformers import (
     AutoTokenizer, 
     AutoModel
 )
+import math
 warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
@@ -19,18 +20,19 @@ from torch.cuda.amp import autocast
 class AudioEmbedder(nn.Module):
     """
     Pre-trained HuBERT to extract audio features from raw audio (16kHz).
-    Projects them down to a desired embedding dimension.
+    Processes with layer norm and conv layers following DenseAV approach.
     """
     def __init__(self, embedding_dim=512, hubert_name="facebook/hubert-base-ls960"):
         super().__init__()
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")  
         self.hubert = HubertModel.from_pretrained(hubert_name)
-        self.projection = nn.Linear(self.hubert.config.hidden_size, embedding_dim)
-        #self.layer_norm = nn.LayerNorm(embedding_dim)
+        
+        # DenseAV-style processing
+        self.layer_norm = nn.LayerNorm(self.hubert.config.hidden_size)
+        self.conv1 = nn.Conv1d(self.hubert.config.hidden_size, embedding_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(embedding_dim, embedding_dim, kernel_size=3, padding=1)
         
         for param in self.hubert.parameters():
-            param.requires_grad = True
-        for param in self.projection.parameters():
             param.requires_grad = True
         
     def forward(self, audio_input: torch.Tensor) -> torch.Tensor:
@@ -58,30 +60,46 @@ class AudioEmbedder(nn.Module):
         
         hubert_output = self.hubert(inputs).last_hidden_state  # (B, T', hidden_size)
         
-        audio_feats = self.projection(hubert_output)  # (B, T', D)
-        #audio_feats = self.layer_norm(audio_feats)
+        # Apply layer norm
+        normalized = self.layer_norm(hubert_output)
+        
+        # Reshape for 1D convolution (B, T, C) -> (B, C, T)
+        features = normalized.transpose(1, 2)
+        
+        # Apply convolutions
+        conv1_out = self.conv1(features)
+        conv2_out = self.conv2(conv1_out)
+        
+        # Reshape back to sequence (B, C, T) -> (B, T, C)
+        audio_feats = conv2_out.transpose(1, 2)
+        
         return audio_feats
 
 
 #################################################################
 #                   Text Embedder
 #################################################################
+
 class TextEmbedder(nn.Module):
     """
     pre-trained BERT-like model to extract text features.
-    Projects them down to a desired embedding dimension.
+    Projects them down with layer norm and convolutions like DenseAV.
     """
     def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base"):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.projection = nn.Linear(self.encoder.config.hidden_size, embedding_dim)
-        #self.layer_norm = nn.LayerNorm(embedding_dim)
+        
+        # DenseAV-style processing
+        self.layer_norm = nn.LayerNorm(self.encoder.config.hidden_size)
+        # Two 3x3 convs to match the audio branch
+        self.conv1 = nn.Conv1d(self.encoder.config.hidden_size, embedding_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(embedding_dim, embedding_dim, kernel_size=3, padding=1)
+        
         print("Using text model: ", model_name)
         
+        # Parameter freezing/unfreezing
         for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.projection.parameters():
             param.requires_grad = True
         
     def forward(self, text_list):
@@ -107,8 +125,20 @@ class TextEmbedder(nn.Module):
 
         outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
         hidden_states = outputs.last_hidden_state
-        text_feats = self.projection(hidden_states)  # (B, Nt, D)
-        #text_feats = self.layer_norm(text_feats)
+        
+        # Apply layer norm
+        normalized = self.layer_norm(hidden_states)
+        
+        # Reshape for 1D convolution (B, T, C) -> (B, C, T)
+        features = normalized.transpose(1, 2)
+        
+        # Apply convolutions
+        conv1_out = self.conv1(features)
+        conv2_out = self.conv2(conv1_out)
+        
+        # Reshape back to sequence (B, C, T) -> (B, T, C)
+        text_feats = conv2_out.transpose(1, 2)
+        
         return text_feats, inputs["attention_mask"]
 
 
@@ -117,16 +147,18 @@ class TextEmbedder(nn.Module):
 #################################################################
 class ViTEmbedder(nn.Module):
     """
-    DINOv2to extract patch embeddings from an image.
-    Then projects to a common dimension with a linear layer.
+    DINOv2 to extract patch embeddings from an image.
+    Processes with layer norm and 1x1 conv following DenseAV approach.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
                  embedding_dim=512, dropout_prob=0.1):
         super().__init__()
         self.model = torch.hub.load(model_name, arch)
         print("Using DINOv2 model: ", arch)
-        self.projection = nn.Linear(self.model.embed_dim, embedding_dim)
-        #self.layer_norm = nn.LayerNorm(embedding_dim)
+        
+        # DenseAV-style processing
+        self.layer_norm = nn.LayerNorm(self.model.embed_dim)
+        self.conv = nn.Conv2d(self.model.embed_dim, embedding_dim, kernel_size=1)
 
         for param in self.model.parameters():
             param.requires_grad = True
@@ -140,14 +172,28 @@ class ViTEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        #print(f"x shape: {x.shape}")
         if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
             x = x.squeeze(0)  # get [1, 3, 224, 224]
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
-        patches = self.model.get_intermediate_layers(x, n=1)[0]  
-        feats = self.projection(patches)
-        #feats = self.layer_norm(feats)
+            
+        # Get patch embeddings
+        patches = self.model.get_intermediate_layers(x, n=1)[0]  # [B, 256, embed_dim]
+        
+        # Apply layer norm
+        normalized = self.layer_norm(patches)
+        
+        # Reshape to spatial grid
+        B, N, C = normalized.shape
+        H = W = int(math.sqrt(N))  # Should be 16 for 224x224 input with patch size 14
+        spatial = normalized.reshape(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
+        
+        # Apply 1x1 conv
+        conv_out = self.conv(spatial)  # [B, embedding_dim, H, W]
+        
+        # Reshape back to token sequence
+        feats = conv_out.flatten(2).transpose(1, 2)  # [B, H*W, embedding_dim]
+        
         return feats
 
 
@@ -174,6 +220,7 @@ class MultiModalModel(nn.Module):
                                            dropout_prob=visual_dropout_prob)
 
         self.temperature = nn.Parameter(torch.tensor(temperature))
+
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
@@ -189,8 +236,8 @@ class MultiModalModel(nn.Module):
         Returns sim: (B, N1, N2)
         """ 
         # ONLY NORMALIZE DURING INFERENCE, TRAINING CAUSES MODEL COLLAPSE
-        #feats1 = F.normalize(feats1, dim=-1)
-        #feats2 = F.normalize(feats2, dim=-1)
+        feats1 = F.normalize(feats1, dim=-1)
+        feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -258,7 +305,7 @@ class MultiModalModel(nn.Module):
         l_cal = temp_low + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.1 * l_smooth)
+        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.4 * l_smooth)
         return reg_loss, 0.1*l_smooth
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
@@ -315,7 +362,7 @@ class MultiModalModel(nn.Module):
         """
         #print(audio.shape)
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            visual_feats = self.visual_embedder(frames)      # (B, Nv, D)
+            visual_feats = self.visual_embedder(frames)     # (B, Nv, D)
             audio_feats = self.audio_embedder(audio)         # (B, Na, D)
         with torch.cuda.amp.autocast(enabled=False):
             if self.training:
@@ -446,7 +493,7 @@ class MultiModalModel(nn.Module):
         else: return (sim_matrix, attention_mask)
         """
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):   
-            visual_feats = self.visual_embedder(frames)               # (B, Nv, D)
+            visual_feats = self.visual_embedder(frames)              # (B, Nv, D)
             text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
         with torch.cuda.amp.autocast(enabled=False):
             if self.training:
@@ -493,7 +540,7 @@ if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
     model = MultiModalModel(
         audio_model_name="facebook/hubert-base-ls960",
-        text_model_name="answerdotai/ModernBERT-base",
+        text_model_name="distilbert/distilbert-base-uncased",
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
@@ -504,9 +551,9 @@ if __name__ == "__main__":
     dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
     dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
     model.train()
-    av_loss = model.forward_audio_visual(dummy_frames, dummy_audio)
+    av_loss, _, _, _, _ = model.forward_audio_visual(dummy_frames, dummy_audio)
     print(f"Audio-Visual loss: {av_loss.item():.4f}")
-    tv_loss = model.forward_text_visual(dummy_frames, dummy_texts)
+    tv_loss, _ = model.forward_text_visual(dummy_frames, dummy_texts)
     print(f"Text-Visual loss: {tv_loss.item():.4f}")
     model.eval()
     with torch.no_grad():
