@@ -13,10 +13,11 @@ from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
+from torchvision import transforms
 
 from dataset import (
     AudioVisualDataset, collate_fn,
-    LocalCaptionDataset
+    LocalCaptionDataset, FlatAudioVisualDataset
 )
 from model import MultiModalModel
 from viz import AudioVisualizer, TextVisualizer
@@ -82,7 +83,11 @@ class MultiModalTrainer:
         num_workers: int = 4,
         device: str = "cuda",
         force_new_training: bool = False,
-        use_amp: bool = True
+        use_amp: bool = True,
+        # New validation parameters
+        audio_visual_val_data_root: str = None,
+        text_dataset_val_path: str = None,
+        validation_frequency: int = 10000  # Run validation every N epochs
     ):
         """
         Args:
@@ -93,6 +98,9 @@ class MultiModalTrainer:
             unfreeze_audio_step, unfreeze_text_step, unfreeze_vit_step:
                 after these step counts, set requires_grad=True for each module
                 and start their OneCycleLR from step=0 to (total_updates - unfreeze_step).
+            audio_visual_val_data_root: path to validation video dataset
+            text_dataset_val_path: path to validation images & text files
+            validation_frequency: run validation every N epochs
         """
         self.device = device
         self.output_dir = Path(output_dir)
@@ -103,6 +111,7 @@ class MultiModalTrainer:
         self.vis_every = vis_every
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.validation_frequency = validation_frequency
         self.config = {
             "batch_size_av": batch_size_av,
             "batch_size_tv": batch_size_tv,
@@ -113,7 +122,8 @@ class MultiModalTrainer:
             "unfreeze_text_step": unfreeze_text_step,
             "unfreeze_vit_step": unfreeze_vit_step,
             "vis_every": vis_every,
-            "save_every_steps": save_every_steps
+            "save_every_steps": save_every_steps,
+            "validation_frequency": validation_frequency
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -138,7 +148,8 @@ class MultiModalTrainer:
             persistent_workers=(num_workers > 0),
             pin_memory=True,
             collate_fn=collate_fn,
-            prefetch_factor=3
+            prefetch_factor=3,
+            drop_last=True
         )
         print("AudioVisualDataset loaded")
         print("Loading LocalCaptionDataset...")
@@ -151,11 +162,64 @@ class MultiModalTrainer:
             collate_fn=collate_text_fn,
             pin_memory=True,
             persistent_workers=(num_workers > 0),
-            prefetch_factor=8
+            prefetch_factor=8,
+            drop_last=True
         )
         print("LocalCaptionDataset loaded")
         self.av_iter = None
         self.tv_iter = None
+
+        # -----------------------------------------------------
+        #  1.1) Validation Datasets / Dataloaders (New)
+        # -----------------------------------------------------
+        self.val_av_dataset = None
+        self.val_tv_dataset = None
+        self.val_av_dataloader = None
+        self.val_tv_dataloader = None
+        
+        if audio_visual_val_data_root:
+            print("Loading Validation AudioVisualDataset...")
+            self.val_av_dataset = FlatAudioVisualDataset(
+                data_root=audio_visual_val_data_root,
+                sample_fps=20
+            )
+            self.val_av_dataloader = DataLoader(
+                self.val_av_dataset,
+                batch_size=batch_size_av,
+                shuffle=False,  # No shuffling for validation
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0),
+                pin_memory=True,
+                collate_fn=collate_fn,
+                prefetch_factor=3,
+                drop_last=True
+            )
+            print("Validation AudioVisualDataset loaded")
+            
+        if text_dataset_val_path:
+            print("Loading Validation LocalCaptionDataset...")
+            # Use clean transform without augmentation for validation
+            val_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+            self.val_tv_dataset = LocalCaptionDataset(
+                text_dataset_val_path, 
+                transform=val_transform
+            )
+            self.val_tv_dataloader = DataLoader(
+                self.val_tv_dataset,
+                batch_size=batch_size_tv,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=collate_text_fn,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=8,
+                drop_last=True
+            )
+            print("Validation LocalCaptionDataset loaded")
 
         # -----------------------------------------------------
         #  2) Model
@@ -164,7 +228,7 @@ class MultiModalTrainer:
             audio_model_name="facebook/hubert-base-ls960",
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
-            temperature=2.0,
+            temperature=1.2,
             patch_sparsity_threshold=1.5,
             patch_sparsity_weight=0.5,
             visual_dropout_prob=0.05,
@@ -238,7 +302,7 @@ class MultiModalTrainer:
         audio_cycle = max(1, self.total_updates - unfreeze_audio_step)
         self.sched_audio = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_audio,
-            max_lr=learning_rate,
+            max_lr=learning_rate*0.75,
             total_steps=audio_cycle,
             pct_start=0.1,
             div_factor=10,
@@ -249,7 +313,7 @@ class MultiModalTrainer:
         text_cycle = max(1, self.total_updates - unfreeze_text_step)
         self.sched_text = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_text,
-            max_lr=learning_rate,
+            max_lr=learning_rate*0.75,
             total_steps=text_cycle,
             pct_start=0.1,
             div_factor=10,
@@ -260,7 +324,7 @@ class MultiModalTrainer:
         vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
         self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_vit,
-            max_lr=learning_rate,
+            max_lr=learning_rate*0.3,
             total_steps=vit_cycle,
             pct_start=0.1,
             div_factor=10,
@@ -294,22 +358,19 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-webow", config=self.config)
+            wandb.init(project=self.project_name, name="Triad", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-webow", config=self.config)
+            wandb.init(project=self.project_name, name="Triad", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
         self.text_viz  = TextVisualizer()
-        self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av)
-        self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv)
-
-    
+        # Get visualization samples (preferably from validation sets if available)
+        self.vis_samples_av = self._get_av_vis_samples(num_vis_samples_av, use_val=bool(self.val_av_dataset))
+        self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
 
         print("Compiling model")
         self.model = torch.compile(self.model, mode="max-autotune")
-
-        
 
         self.logger.info("Initialized MultiModalTrainer with multiple schedulers.")
 
@@ -333,7 +394,7 @@ class MultiModalTrainer:
 
         return max(ckpts, key=_parse_ckpt_name)
 
-    def save_checkpoint(self, epoch, step):
+    def save_checkpoint(self, epoch, step, is_best=False):
         ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}_step{step}.pt"
         rng_state = {
             "torch": torch.get_rng_state(),
@@ -368,6 +429,11 @@ class MultiModalTrainer:
         }
         torch.save(ckpt, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
+        
+        if is_best:
+            best_path = self.output_dir / "best_model.pt"
+            torch.save(ckpt, best_path)
+            self.logger.info(f"Saved best model checkpoint: {best_path}")
 
     def load_checkpoint(self, ckpt_path):
         self.logger.info(f"Loading checkpoint from {ckpt_path}")
@@ -424,6 +490,7 @@ class MultiModalTrainer:
 
         self.vis_samples_av = ck["vis_samples_av"]
         self.vis_samples_tv = ck["vis_samples_tv"]
+        self.best_loss = ck["best_loss"]
         self._update_frozen_params(self.global_step)
         del ck
 
@@ -472,10 +539,13 @@ class MultiModalTrainer:
     ###########################################
     #     Visualization logic
     ###########################################
-    def _get_av_vis_samples(self, n_samples=2):
+    def _get_av_vis_samples(self, n_samples=2, use_val=False):
         """Get clean samples for visualization without augmentation"""
+        # Use validation dataset if requested and available
+        dataset = self.val_av_dataset if use_val and self.val_av_dataset else self.av_dataset
+        
         batch_dataloader = DataLoader(
-            self.av_dataset, 
+            dataset, 
             batch_size=n_samples, 
             shuffle=True,
             num_workers=1,
@@ -492,8 +562,8 @@ class MultiModalTrainer:
             if i >= n_samples:
                 break
                 
-            sample = self.av_dataset.__getitem__(
-                self.av_dataset.video_files.index(Path(video_path)), 
+            sample = dataset.__getitem__(
+                dataset.video_files.index(Path(video_path)), 
                 apply_augmentation=False  # Important: no augmentation for viz
             )
             
@@ -514,19 +584,40 @@ class MultiModalTrainer:
             "video_paths": video_paths
         }
 
-    def _get_tv_vis_samples(self, n_samples=2):
-        batch = next(iter(self.tv_dataloader))
-        # Instead of using batch images directly, get the original files
-        # and apply clean_transform
+    def _get_tv_vis_samples(self, n_samples=2, use_val=False):
+        """Get clean samples for visualization without augmentation"""
+        # Use validation dataset if requested and available
+        dataset = self.val_tv_dataset if use_val and self.val_tv_dataset else self.tv_dataset
+        
+        # Use dataset's clean transform for consistent visualization
+        clean_transform = dataset.clean_transform
+        
+        # Get a batch from the dataset
+        batch_dataloader = DataLoader(
+            dataset,
+            batch_size=n_samples,
+            shuffle=True,
+            collate_fn=collate_text_fn
+        )
+        batch = next(iter(batch_dataloader))
+        
+        # Get original images with clean transform
         images = []
         captions = []
         for i in range(min(n_samples, len(batch['images']))):
-            img_path = self.tv_dataset.image_files[i]
-            img = Image.open(img_path).convert('RGB')
-            images.append(self.tv_dataset.clean_transform(img))
-            txt_path = img_path.with_suffix('.txt')
-            with open(txt_path, 'r') as f:
-                captions.append(f.read().strip())
+            idx = i  # In this simple case, we just use the index in the batch
+            if hasattr(dataset, 'image_files'):  # LocalCaptionDataset
+                img_path = dataset.image_files[idx]
+                img = Image.open(img_path).convert('RGB')
+                images.append(clean_transform(img))
+                
+                txt_path = img_path.with_suffix('.txt')
+                with open(txt_path, 'r') as f:
+                    captions.append(f.read().strip())
+            else:
+                # Fallback to batch images if we can't reconstruct
+                images.append(batch['images'][i])
+                captions.append(batch['captions'][i])
         
         return {
             "images": torch.stack(images),
@@ -591,10 +682,112 @@ class MultiModalTrainer:
         gc.collect()
 
     ###########################################
+    #           Validation Method (New)
+    ###########################################
+    def validate(self):
+        """
+        Evaluate model on validation datasets and compute losses.
+        Returns the overall validation loss if validation datasets are available.
+        """
+        if not self.val_av_dataloader and not self.val_tv_dataloader:
+            self.logger.info("No validation datasets provided. Skipping validation.")
+            return None, None
+            
+        self.model.eval()
+        av_losses = []
+        tv_losses = []
+        av_contrastive_losses = []
+        av_reg_losses = []
+        av_smooth_losses = []
+        av_sim_stats_list = []
+        tv_sim_stats_list = []
+        
+        # Validate audio-visual
+        if self.val_av_dataloader:
+            with torch.no_grad():
+                for av_batch in tqdm(self.val_av_dataloader, desc="Validating A/V"):
+                    frames_av = av_batch['frame'].to(self.device)
+                    audio_av = av_batch['audio'].to(self.device)
+                    loss_av, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
+                    av_losses.append(loss_av.item())
+                    av_contrastive_losses.append(av_contrastive.item())
+                    av_reg_losses.append(av_reg.item())
+                    av_smooth_losses.append(av_smooth.item())
+                    av_sim_stats_list.append(av_sim_stats)
+        
+        # Validate text-visual
+        if self.val_tv_dataloader:
+            with torch.no_grad():
+                for tv_batch in tqdm(self.val_tv_dataloader, desc="Validating T/V"):
+                    frames_tv = tv_batch['images'].to(self.device)
+                    texts_tv = tv_batch['captions']
+                    loss_tv, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+                    tv_losses.append(loss_tv.item())
+                    tv_sim_stats_list.append(tv_sim_stats)
+        
+        # Compute average metrics
+        avg_av_loss = np.mean(av_losses) if av_losses else None
+        avg_tv_loss = np.mean(tv_losses) if tv_losses else None
+        avg_av_contrastive = np.mean(av_contrastive_losses) if av_contrastive_losses else None
+        avg_av_reg = np.mean(av_reg_losses) if av_reg_losses else None
+        avg_av_smooth = np.mean(av_smooth_losses) if av_smooth_losses else None
+        
+        # Average similarity stats across batches
+        avg_av_sim_stats = {}
+        if av_sim_stats_list:
+            for key in av_sim_stats_list[0].keys():
+                avg_av_sim_stats[f"val_{key}"] = np.mean([stats[key] for stats in av_sim_stats_list if key in stats])
+        
+        avg_tv_sim_stats = {}
+        if tv_sim_stats_list:
+            for key in tv_sim_stats_list[0].keys():
+                avg_tv_sim_stats[f"val_{key}"] = np.mean([stats[key] for stats in tv_sim_stats_list if key in stats])
+        
+        # Log validation metrics
+        if self.use_wandb:
+            wandb_dict = {
+                "epoch": self.start_epoch,
+                "global_step": self.global_step
+            }
+            
+            if avg_av_loss is not None:
+                wandb_dict["val_loss_av"] = avg_av_loss
+                wandb_dict["val_av_contrastive_loss"] = avg_av_contrastive
+                wandb_dict["val_av_reg_loss"] = avg_av_reg
+                wandb_dict["val_av_smooth_loss"] = avg_av_smooth
+            
+            if avg_tv_loss is not None:
+                wandb_dict["val_loss_tv"] = avg_tv_loss
+                
+            if avg_av_loss is not None and avg_tv_loss is not None:
+                wandb_dict["val_loss_total"] = avg_av_loss + avg_tv_loss
+                
+            wandb_dict.update(avg_av_sim_stats)
+            wandb_dict.update(avg_tv_sim_stats)
+            
+            wandb.log(wandb_dict)
+        
+        self.model.train()
+        
+        # Return the total validation loss
+        val_total_loss = None
+        if avg_av_loss is not None and avg_tv_loss is not None:
+            val_total_loss = avg_av_loss + avg_tv_loss
+        elif avg_av_loss is not None:
+            val_total_loss = avg_av_loss
+        elif avg_tv_loss is not None:
+            val_total_loss = avg_tv_loss
+
+        print(f"Validation loss: {val_total_loss:.4f}")
+            
+        return avg_av_loss, avg_tv_loss, val_total_loss
+
+    ###########################################
     #           Main Training Loop
     ###########################################
     def train(self):
         accumulation_counter = 0
+        #val_av_loss, val_tv_loss, val_total_loss = self.validate()
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             self.logger.info(f"Epoch {epoch} starting")
             if self.current_batch_idx == 0 or self.start_epoch == 2:  # Fresh epoch
@@ -723,10 +916,32 @@ class MultiModalTrainer:
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
+                if self.global_step > 0 and self.global_step%self.validation_frequency == 0:
+                    val_av_loss, val_tv_loss, val_total_loss = self.validate()
+                    print(f"Validation_Audio_Visual: {val_av_loss:.4f}, Validation_Text_Visual: {val_tv_loss:.4f}, Validation_Total: {val_total_loss:.4f}")
 
                 self.global_step += 1
+                
+            # End of epoch
             epoch_loss = np.mean(epoch_losses)
             self.logger.info(f"Epoch {epoch} completed. Average loss={epoch_loss:.4f}")
+            
+            # Run validation at the end of each epoch if the frequency criteria is met
+            if (self.val_av_dataloader or self.val_tv_dataloader):
+                self.logger.info(f"Running validation after epoch {epoch}...")
+                val_av_loss, val_tv_loss, val_total_loss = self.validate()
+                if val_total_loss is not None:
+                    self.logger.info(f"Validation loss after epoch {epoch}: {val_total_loss:.4f}")
+                    
+                    # Save best model based on validation loss
+                    if val_total_loss < self.best_loss:
+                        self.best_loss = val_total_loss
+                        self.save_checkpoint(epoch, self.global_step, is_best=True)
+                        self.logger.info(f"New best model saved with val_loss: {val_total_loss:.4f}")
+            
+            # Reset batch index for the next epoch
+        
+
             self.current_batch_idx = 0
             self.save_checkpoint(epoch, self.global_step)
 
@@ -742,25 +957,28 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
-        output_dir="./outputs-webow",
+        audio_visual_val_data_root="/home/cis/UnGodSet", 
+        text_dataset_val_path="/home/cis/cc3m-ironic-val",  
+        output_dir="./outputs-railgun",
         batch_size_av=22,
         batch_size_tv=22,
-        num_epochs=10,  
+        num_epochs=7,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
-        vis_every=5000,
-        save_every_steps=5000,
-        num_workers=8,
+        vis_every=10000,
+        save_every_steps=10000,
+        num_workers=10,
         device="cuda",
         gradient_accumulation_steps=3,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
-        project_name="Triad",
+        project_name="TriadNerd",
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
-        use_amp=True
+        use_amp=True,
+        validation_frequency=10000
     )
 
     trainer.train()

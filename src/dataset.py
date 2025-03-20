@@ -29,13 +29,11 @@ class LocalCaptionDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
         self.root_dir = Path(root_dir)
         self.transform = transform or transforms.Compose([
-            # These augmentations work even with 224×224 images
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)), # Small translations
             transforms.ToTensor(),
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Random erasing for robustness
-            
+            #transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Random erasing for robustness
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                             std=[0.229, 0.224, 0.225])
         ])
@@ -220,6 +218,7 @@ class AudioVisualDataset(Dataset):
         self.current_segment = int((self.segment_folders[0].name).split('_')[1])
         self.video_files = self.segment_to_videos[self.current_segment]
 
+
     def switch_segment(self):
         """Randomly switch to a different segment"""
         available_segments = list(self.segment_to_videos.keys())
@@ -235,6 +234,60 @@ class AudioVisualDataset(Dataset):
     def __getitem__(self, idx, apply_augmentation=True):
         """Get dataset item with option to apply augmentation"""
         video_path = self.video_files[idx]
+        error_occurred = False
+        
+        try: 
+            audio = extract_audio_from_video(video_path)
+        except Exception as e:
+            print(f"Error processing {video_path} audio: {str(e)}")
+            audio = torch.zeros(16331)
+ 
+            
+        try:
+            video_frame = load_and_preprocess_video(str(video_path), self.sample_fps, apply_augmentation=apply_augmentation)
+        except Exception as e:
+            print(f"Error processing {video_path} video frame: {str(e)}")
+            video_frame = torch.zeros(3, 224, 224)
+        
+        return {
+            'video_path': str(video_path),
+            'video_frames': video_frame, 
+            'audio': audio,
+            #'vid_num': int(video_path.stem.split('_')[0]),
+            #'segment_num': self.current_segment
+        }
+        
+
+# Add this class to train.py before the MultiModalTrainer class
+class FlatAudioVisualDataset(Dataset):
+    """
+    Version of AudioVisualDataset that works with a flat directory structure
+    (no segment subdirectories)
+    """
+    def __init__(self, data_root: str, sample_fps: int = 20):
+        self.data_root = Path(data_root)
+        self.sample_fps = sample_fps
+        # Directly gather all mp4 files in the root directory
+        self.video_files = sorted(list(self.data_root.glob("*.mp4")))
+        if not self.video_files:
+            raise ValueError(f"No MP4 files found in {data_root}")
+            
+        print(f"Found {len(self.video_files)} videos in flat directory {data_root}")
+        
+        # No segments in this version
+        self.current_segment = 0
+        
+    def switch_segment(self):
+        # No-op for flat dataset
+        pass
+    
+    def __len__(self):
+        return len(self.video_files)
+    
+    def __getitem__(self, idx, apply_augmentation=True):
+        """Get dataset item with option to apply augmentation"""
+        video_path = self.video_files[idx]
+        
         try: 
             audio = extract_audio_from_video(video_path)
         except Exception as e:
@@ -251,10 +304,7 @@ class AudioVisualDataset(Dataset):
             'video_path': str(video_path),
             'video_frames': video_frame, 
             'audio': audio,
-            #'vid_num': int(video_path.stem.split('_')[0]),
-            #'segment_num': self.current_segment
         }
-        
 
 def collate_fn(batch):
     video_tokens = torch.stack([item['video_frames'] for item in batch])
@@ -274,7 +324,7 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    print("Testing LocalCaptionDataset...")
+    '''print("Testing LocalCaptionDataset...")
     dataset = LocalCaptionDataset("/home/cis/cc3m")
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
     
@@ -283,8 +333,8 @@ if __name__ == "__main__":
         print(f"\nBatch {batch_idx + 1}")
         print(f"Image batch shape: {images.shape}")  # Should be [4, 3, 224, 224]
         print(f"Sample caption: {captions[0]}")
-        break
-
+        break'''
+    import tqdm
     print("Testing AudioVisualDataset with segmented structure...")
     
     dataset = AudioVisualDataset(
@@ -295,19 +345,42 @@ if __name__ == "__main__":
         dataset,
         batch_size=18,
         shuffle=True,
-        num_workers=8,
+        num_workers=12,
         persistent_workers=True,
         pin_memory=True,
         collate_fn=collate_fn,
         prefetch_factor=3
     )
-    for batch_idx, batch in enumerate(dataloader):
-        print(f"\nBatch {batch_idx + 1}")
-        print(f"Current segment: {dataset.current_segment}")
-        print(f"Frame shape: {batch['frame'].shape}")
-        print(f"Audio shape: {batch['audio'].shape}")
-        print(f"Sample video path: {batch['video_paths'][0]}")
-        if batch_idx % 3 == 0:
-            dataset.switch_segment()
+    for batch_idx, batch in enumerate(tqdm.tqdm(dataloader)):
+        #print(f"\nBatch {batch_idx + 1}")
+        #print(f"Current segment: {dataset.current_segment}")
+        #print(f"Frame shape: {batch['frame'].shape}")
+        #print(f"Audio shape: {batch['audio'].shape}")
+        #print(f"Sample video path: {batch['video_paths'][0]}")
+        #break
+        #if batch_idx % 3 == 0:
+            #dataset.switch_segment()
+        pass
+    
+    print("Dataset processing complete. Errors have been logged to segmented_error_videos.txt")
+
+    print("Testing FlatAudioVisualDataset...")
+    dataset = FlatAudioVisualDataset(
+        data_root="/home/cis/UnGodSet",
+        sample_fps=20
+    )
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=12, collate_fn=collate_fn)
+    
+    print("Processing dataset...")
+    for batch_idx, batch in enumerate(tqdm.tqdm(dataloader)):
+        pass
+        #print(f"\nBatch {batch_idx + 1}")
+        #print(f"Frame shape: {batch['frame'].shape}")
+        #print(f"Audio shape: {batch['audio'].shape}")
+        #print(f"Sample video path: {batch['video_paths'][0]}")
+    
+    print("Dataset processing complete. Errors have been logged to error_videos.txt")
+    # No need to write from the list anymore as errors are logged directly during processing
+        
             
         
