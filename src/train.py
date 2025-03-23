@@ -87,7 +87,13 @@ class MultiModalTrainer:
         # New validation parameters
         audio_visual_val_data_root: str = None,
         text_dataset_val_path: str = None,
-        validation_frequency: int = 10000  # Run validation every N epochs
+        validation_frequency: int = 10000,  # Run validation every N epochs
+        # New staged training parameters
+        av_focus_epochs: int = 3,
+        tv_warmup_epochs: int = 1,
+        weighted_joint_epochs: int = 2,
+        av_weight_start: float = 0.8,
+        av_weight_end: float = 0.5,
     ):
         """
         Args:
@@ -101,6 +107,11 @@ class MultiModalTrainer:
             audio_visual_val_data_root: path to validation video dataset
             text_dataset_val_path: path to validation images & text files
             validation_frequency: run validation every N epochs
+            av_focus_epochs: number of epochs to focus only on audio-visual training
+            tv_warmup_epochs: number of epochs to focus only on text-visual training
+            weighted_joint_epochs: number of epochs to gradually shift from AV to balanced
+            av_weight_start: starting weight for AV loss in weighted joint phase
+            av_weight_end: ending weight for AV loss in weighted joint phase
         """
         self.device = device
         self.output_dir = Path(output_dir)
@@ -112,6 +123,14 @@ class MultiModalTrainer:
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.validation_frequency = validation_frequency
+        
+        # Store the new staged training parameters
+        self.av_focus_epochs = av_focus_epochs
+        self.tv_warmup_epochs = tv_warmup_epochs
+        self.weighted_joint_epochs = weighted_joint_epochs 
+        self.av_weight_start = av_weight_start
+        self.av_weight_end = av_weight_end
+        
         self.config = {
             "batch_size_av": batch_size_av,
             "batch_size_tv": batch_size_tv,
@@ -123,7 +142,12 @@ class MultiModalTrainer:
             "unfreeze_vit_step": unfreeze_vit_step,
             "vis_every": vis_every,
             "save_every_steps": save_every_steps,
-            "validation_frequency": validation_frequency
+            "validation_frequency": validation_frequency,
+            "av_focus_epochs": av_focus_epochs,
+            "tv_warmup_epochs": tv_warmup_epochs,
+            "weighted_joint_epochs": weighted_joint_epochs,
+            "av_weight_start": av_weight_start,
+            "av_weight_end": av_weight_end
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -358,9 +382,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-uhoh", config=self.config)
+            wandb.init(project=self.project_name, name="Triad", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-uhoh", config=self.config)
+            wandb.init(project=self.project_name, name="Triad", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -470,6 +494,32 @@ class MultiModalTrainer:
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         self.av_dataset.current_segment = ck["current_segment"]
+
+        # Check for phase configuration differences
+        ckpt_config = ck.get("config", {})
+        ckpt_av_focus = ckpt_config.get("av_focus_epochs", self.av_focus_epochs)
+        ckpt_tv_warmup = ckpt_config.get("tv_warmup_epochs", self.tv_warmup_epochs)
+        ckpt_weighted_joint = ckpt_config.get("weighted_joint_epochs", self.weighted_joint_epochs)
+        
+        if (ckpt_av_focus != self.av_focus_epochs or 
+            ckpt_tv_warmup != self.tv_warmup_epochs or
+            ckpt_weighted_joint != self.weighted_joint_epochs):
+            self.logger.warning(
+                f"WARNING: Checkpoint has different training phases! "
+                f"Checkpoint: AV focus={ckpt_av_focus}, TV warmup={ckpt_tv_warmup}, "
+                f"Weighted joint={ckpt_weighted_joint} | "
+                f"Current: AV focus={self.av_focus_epochs}, TV warmup={self.tv_warmup_epochs}, "
+                f"Weighted joint={self.weighted_joint_epochs}"
+            )
+            # Determine if we need to adjust the current epoch to maintain phase consistency
+            total_phases_ckpt = ckpt_av_focus + ckpt_tv_warmup + ckpt_weighted_joint
+            total_phases_current = self.av_focus_epochs + self.tv_warmup_epochs + self.weighted_joint_epochs
+            
+            if total_phases_ckpt != total_phases_current:
+                self.logger.warning(
+                    f"Total phase duration differs: checkpoint={total_phases_ckpt}, current={total_phases_current}. "
+                    f"This may affect training continuity."
+                )
 
         rng_state = ck.get("rng_state", None)
         if rng_state is not None:
@@ -625,57 +675,77 @@ class MultiModalTrainer:
         }
 
     def visualize_samples(self, epoch):
+        """Generate visualizations based on current training phase."""
+        # Determine current phase
+        if epoch < self.av_focus_epochs:
+            phase = "av_focus"
+        elif epoch < self.av_focus_epochs + self.tv_warmup_epochs:
+            phase = "tv_warmup"
+        elif epoch < self.av_focus_epochs + self.tv_warmup_epochs + self.weighted_joint_epochs:
+            phase = "weighted_joint"
+        else:
+            phase = "full_joint"
+            
+        self.logger.info(f"Generating visualizations for phase: {phase}")
         self.model.eval()
 
-        # 1) Audio-Visual
-        with torch.no_grad():
-            for i in range(len(self.vis_samples_av["frames"])):
-                frame = self.vis_samples_av["frames"][i].to(self.device)
-                audio = self.vis_samples_av["audio"][i].to(self.device)
-                video_path = self.vis_samples_av["video_paths"][i]
+        # 1) Audio-Visual - only visualize if not in tv_warmup phase
+        if phase != "tv_warmup":
+            with torch.no_grad():
+                for i in range(len(self.vis_samples_av["frames"])):
+                    frame = self.vis_samples_av["frames"][i].to(self.device)
+                    audio = self.vis_samples_av["audio"][i].to(self.device)
+                    video_path = self.vis_samples_av["video_paths"][i]
 
-                out_file_img = self.output_dir / f"av_snapshot_epoch{epoch}_sample{i}.png"
-                self.audio_viz.plot_audio_token_attentions(
-                    model=self.model,
-                    frame=frame,
-                    audio=audio,
-                    output_path=str(out_file_img),
-                    num_tokens_to_show=5
-                )
-                out_file_vid = self.output_dir / f"av_viz_epoch{epoch}_sample{i}.mp4"
-                self.audio_viz.make_attention_video(
-                    model=self.model,
-                    frame=frame,
-                    audio=audio,
-                    output_path=out_file_vid,
-                    video_path=video_path,
-                    fps=50
-                )
-                if self.use_wandb:
-                    wandb.log({
-                        f"av_attention_sample_{i}": wandb.Image(str(out_file_img)),
-                        "epoch": epoch,
-                        "global_step": self.global_step
-                    })
+                    out_file_img = self.output_dir / f"av_snapshot_epoch{epoch}_sample{i}.png"
+                    self.audio_viz.plot_audio_token_attentions(
+                        model=self.model,
+                        frame=frame,
+                        audio=audio,
+                        output_path=str(out_file_img),
+                        num_tokens_to_show=5
+                    )
+                    out_file_vid = self.output_dir / f"av_viz_epoch{epoch}_sample{i}.mp4"
+                    self.audio_viz.make_attention_video(
+                        model=self.model,
+                        frame=frame,
+                        audio=audio,
+                        output_path=out_file_vid,
+                        video_path=video_path,
+                        fps=50
+                    )
+                    if self.use_wandb:
+                        wandb.log({
+                            f"av_attention_sample_{i}": wandb.Image(str(out_file_img)),
+                            "epoch": epoch,
+                            "global_step": self.global_step,
+                            "visualization_phase": phase
+                        })
+        else:
+            self.logger.info("Skipping A/V visualization in TV warmup phase")
 
-        # 2) Text-Visual
-        with torch.no_grad():
-            for i in range(len(self.vis_samples_tv["images"])):
-                frame = self.vis_samples_tv["images"][i].to(self.device)
-                text = self.vis_samples_tv["texts"][i]
-                out_file_img = self.output_dir / f"tv_viz_epoch{epoch}_sample{i}.png"
-                self.text_viz.plot_token_attentions(
-                    model=self.model,
-                    frame=frame,
-                    text=text,
-                    output_path=str(out_file_img)
-                )
-                if self.use_wandb:
-                    wandb.log({
-                        f"tv_attention_sample_{i}": wandb.Image(str(out_file_img), caption=text),
-                        "epoch": epoch,
-                        "global_step": self.global_step
-                    })
+        # 2) Text-Visual - only visualize if not in av_focus phase
+        if phase != "av_focus":
+            with torch.no_grad():
+                for i in range(len(self.vis_samples_tv["images"])):
+                    frame = self.vis_samples_tv["images"][i].to(self.device)
+                    text = self.vis_samples_tv["texts"][i]
+                    out_file_img = self.output_dir / f"tv_viz_epoch{epoch}_sample{i}.png"
+                    self.text_viz.plot_token_attentions(
+                        model=self.model,
+                        frame=frame,
+                        text=text,
+                        output_path=str(out_file_img)
+                    )
+                    if self.use_wandb:
+                        wandb.log({
+                            f"tv_attention_sample_{i}": wandb.Image(str(out_file_img), caption=text),
+                            "epoch": epoch,
+                            "global_step": self.global_step,
+                            "visualization_phase": phase
+                        })
+        else:
+            self.logger.info("Skipping T/V visualization in AV focus phase")
 
         self.model.train()
         plt.close('all')
@@ -684,14 +754,25 @@ class MultiModalTrainer:
     ###########################################
     #           Validation Method (New)
     ###########################################
-    def validate(self):
+    def validate(self, phase=None):
         """
-        Evaluate model on validation datasets and compute losses.
+        Evaluate model on validation datasets based on current training phase.
         Returns the overall validation loss if validation datasets are available.
         """
+        if phase is None:
+            # Determine phase based on current epoch if not provided
+            if self.start_epoch < self.av_focus_epochs:
+                phase = "av_focus"
+            elif self.start_epoch < self.av_focus_epochs + self.tv_warmup_epochs:
+                phase = "tv_warmup"
+            elif self.start_epoch < self.av_focus_epochs + self.tv_warmup_epochs + self.weighted_joint_epochs:
+                phase = "weighted_joint"
+            else:
+                phase = "full_joint"
+                
         if not self.val_av_dataloader and not self.val_tv_dataloader:
             self.logger.info("No validation datasets provided. Skipping validation.")
-            return None, None
+            return None, None, None
             
         self.model.eval()
         av_losses = []
@@ -702,8 +783,8 @@ class MultiModalTrainer:
         av_sim_stats_list = []
         tv_sim_stats_list = []
         
-        # Validate audio-visual
-        if self.val_av_dataloader:
+        # Only validate A/V if not in text-visual warmup phase
+        if (phase != "tv_warmup") and self.val_av_dataloader:
             with torch.no_grad():
                 for av_batch in tqdm(self.val_av_dataloader, desc="Validating A/V"):
                     frames_av = av_batch['frame'].to(self.device)
@@ -715,8 +796,8 @@ class MultiModalTrainer:
                     av_smooth_losses.append(av_smooth.item())
                     av_sim_stats_list.append(av_sim_stats)
         
-        # Validate text-visual
-        if self.val_tv_dataloader:
+        # Only validate T/V if not in audio-visual focus phase
+        if (phase != "av_focus") and self.val_tv_dataloader:
             with torch.no_grad():
                 for tv_batch in tqdm(self.val_tv_dataloader, desc="Validating T/V"):
                     frames_tv = tv_batch['images'].to(self.device)
@@ -731,6 +812,26 @@ class MultiModalTrainer:
         avg_av_contrastive = np.mean(av_contrastive_losses) if av_contrastive_losses else None
         avg_av_reg = np.mean(av_reg_losses) if av_reg_losses else None
         avg_av_smooth = np.mean(av_smooth_losses) if av_smooth_losses else None
+        
+        # Calculate total validation loss based on current phase
+        val_total_loss = None
+        if phase == "av_focus" and avg_av_loss is not None:
+            val_total_loss = avg_av_loss
+        elif phase == "tv_warmup" and avg_tv_loss is not None:
+            val_total_loss = avg_tv_loss
+        elif phase == "weighted_joint" and avg_av_loss is not None and avg_tv_loss is not None:
+            # Use same weighting as training
+            current_epoch = self.start_epoch  # Use actual current epoch
+            progress = min(1.0, max(0.0, (current_epoch - (self.av_focus_epochs + self.tv_warmup_epochs)) / self.weighted_joint_epochs))
+            av_weight = self.av_weight_start - progress * (self.av_weight_start - self.av_weight_end)
+            tv_weight = 1.0 - av_weight
+            val_total_loss = av_weight * avg_av_loss + tv_weight * avg_tv_loss
+        elif avg_av_loss is not None and avg_tv_loss is not None:
+            val_total_loss = avg_av_loss + avg_tv_loss
+        elif avg_av_loss is not None:
+            val_total_loss = avg_av_loss
+        elif avg_tv_loss is not None:
+            val_total_loss = avg_tv_loss
         
         # Average similarity stats across batches
         avg_av_sim_stats = {}
@@ -747,7 +848,8 @@ class MultiModalTrainer:
         if self.use_wandb:
             wandb_dict = {
                 "epoch": self.start_epoch,
-                "global_step": self.global_step
+                "global_step": self.global_step,
+                "validation_phase": phase
             }
             
             if avg_av_loss is not None:
@@ -759,8 +861,13 @@ class MultiModalTrainer:
             if avg_tv_loss is not None:
                 wandb_dict["val_loss_tv"] = avg_tv_loss
                 
-            if avg_av_loss is not None and avg_tv_loss is not None:
-                wandb_dict["val_loss_total"] = avg_av_loss + avg_tv_loss
+            if val_total_loss is not None:
+                wandb_dict["val_loss_total"] = val_total_loss
+                
+            # Include weighted values during weighted phase
+            if phase == "weighted_joint":
+                wandb_dict["val_av_weight"] = av_weight
+                wandb_dict["val_tv_weight"] = tv_weight
                 
             wandb_dict.update(avg_av_sim_stats)
             wandb_dict.update(avg_tv_sim_stats)
@@ -769,17 +876,6 @@ class MultiModalTrainer:
         
         self.model.train()
         
-        # Return the total validation loss
-        val_total_loss = None
-        if avg_av_loss is not None and avg_tv_loss is not None:
-            val_total_loss = avg_av_loss + avg_tv_loss
-        elif avg_av_loss is not None:
-            val_total_loss = avg_av_loss
-        elif avg_tv_loss is not None:
-            val_total_loss = avg_tv_loss
-
-        print(f"Validation loss: {val_total_loss:.4f}")
-            
         return avg_av_loss, avg_tv_loss, val_total_loss
 
     ###########################################
@@ -787,8 +883,36 @@ class MultiModalTrainer:
     ###########################################
     def train(self):
         accumulation_counter = 0
-        #val_av_loss, val_tv_loss, val_total_loss = self.validate()
+        
         for epoch in range(self.start_epoch, self.config['num_epochs']):
+            # Determine training phase based on current epoch
+            if epoch < self.av_focus_epochs:
+                phase = "av_focus"
+                self.logger.info(f"Epoch {epoch} - Phase: Audio-Visual Focus")
+            elif epoch < self.av_focus_epochs + self.tv_warmup_epochs:
+                phase = "tv_warmup"
+                self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Warmup")
+            elif epoch < self.av_focus_epochs + self.tv_warmup_epochs + self.weighted_joint_epochs:
+                phase = "weighted_joint"
+                # Calculate dynamic weights
+                progress = (epoch - (self.av_focus_epochs + self.tv_warmup_epochs)) / self.weighted_joint_epochs
+                av_weight = self.av_weight_start - progress * (self.av_weight_start - self.av_weight_end)
+                tv_weight = 1.0 - av_weight
+                self.logger.info(f"Epoch {epoch} - Phase: Weighted Joint (AV: {av_weight:.2f}, TV: {tv_weight:.2f})")
+            else:
+                phase = "full_joint"
+                self.logger.info(f"Epoch {epoch} - Phase: Full Joint Training")
+                
+            # Log phase transition clearly
+            if epoch == 0 or self.start_epoch == epoch:
+                self.logger.info(f"STARTING PHASE: {phase.upper()}")
+            elif epoch == self.av_focus_epochs:
+                self.logger.info(f"PHASE TRANSITION: AV FOCUS → TV WARMUP")
+            elif epoch == self.av_focus_epochs + self.tv_warmup_epochs:
+                self.logger.info(f"PHASE TRANSITION: TV WARMUP → WEIGHTED JOINT")
+            elif epoch == self.av_focus_epochs + self.tv_warmup_epochs + self.weighted_joint_epochs:
+                self.logger.info(f"PHASE TRANSITION: WEIGHTED JOINT → FULL JOINT")
+                
             self.logger.info(f"Epoch {epoch} starting")
             if self.current_batch_idx == 0 or self.start_epoch == 2:  # Fresh epoch
                 print("Switching segment")
@@ -812,31 +936,57 @@ class MultiModalTrainer:
                     next(self.tv_iter)
 
             max_steps = max(len(self.av_dataloader), len(self.tv_dataloader))
-            pbar = tqdm(range(max_steps-self.current_batch_idx), desc=f"Epoch {epoch}")
+            pbar = tqdm(range(max_steps-self.current_batch_idx), desc=f"Epoch {epoch} ({phase})")
             epoch_losses = []
 
             for batch_idx in pbar:
                 self._update_frozen_params(self.global_step)
-                try:
-                    av_batch = next(self.av_iter)
-                except StopIteration:
-                    print("StopIteration in av_iter")
-                    self.av_iter = iter(self.av_dataloader)
-                    av_batch = next(self.av_iter)
-                frames_av = av_batch['frame'].to(self.device)
-                audio_av  = av_batch['audio'].to(self.device)
-                try:
-                    tv_batch = next(self.tv_iter)
-                except StopIteration:
-                    print("StopIteration in tv_iter")
-                    self.tv_iter = iter(self.tv_dataloader)
-                    tv_batch = next(self.tv_iter)
-                frames_tv = tv_batch['images'].to(self.device)
-                texts_tv  = tv_batch['captions']
-                self.model.train()
-                loss_av, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
-                loss_tv, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
-                loss_total = loss_av + loss_tv
+                
+                # Process Audio-Visual data (except in tv_warmup phase)
+                av_loss = av_contrastive = av_reg = av_smooth = None
+                av_sim_stats = {}
+                if phase != "tv_warmup":
+                    try:
+                        av_batch = next(self.av_iter)
+                    except StopIteration:
+                        print("StopIteration in av_iter")
+                        self.av_iter = iter(self.av_dataloader)
+                        av_batch = next(self.av_iter)
+                    frames_av = av_batch['frame'].to(self.device)
+                    audio_av = av_batch['audio'].to(self.device)
+                    
+                    av_loss, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
+                
+                # Process Text-Visual data (except in av_focus phase)
+                tv_loss = None
+                tv_sim_stats = {}
+                if phase != "av_focus":
+                    try:
+                        tv_batch = next(self.tv_iter)
+                    except StopIteration:
+                        print("StopIteration in tv_iter")
+                        self.tv_iter = iter(self.tv_dataloader)
+                        tv_batch = next(self.tv_iter)
+                    frames_tv = tv_batch['images'].to(self.device)
+                    texts_tv = tv_batch['captions']
+                    
+                    tv_loss, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+                
+                # Calculate total loss based on current phase
+                if phase == "av_focus":
+                    loss_total = av_loss
+                    tv_loss = torch.tensor(0.0, device=self.device)  # Dummy for logging
+                elif phase == "tv_warmup":
+                    loss_total = tv_loss
+                    av_loss = av_contrastive = av_reg = av_smooth = torch.tensor(0.0, device=self.device)  # Dummy for logging
+                elif phase == "weighted_joint":
+                    progress = (epoch - (self.av_focus_epochs + self.tv_warmup_epochs)) / self.weighted_joint_epochs
+                    av_weight = self.av_weight_start - progress * (self.av_weight_start - self.av_weight_end)
+                    tv_weight = 1.0 - av_weight
+                    loss_total = av_weight * av_loss + tv_weight * tv_loss
+                else:  # full_joint
+                    loss_total = av_loss + tv_loss
+                
                 loss_scaled = loss_total / self.gradient_accumulation_steps
                 loss_scaled.backward()
                 accumulation_counter += 1
@@ -882,33 +1032,60 @@ class MultiModalTrainer:
                             self.step_vit += 1
                     else:
                         self.opt_vit.zero_grad()
+                
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
-                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
+                pbar.set_postfix({"loss": f"{loss_val:.4f}", "phase": phase})
 
                 if self.use_wandb:
                     wandb_dict = {
                         "train_loss": loss_val,
-                        "loss_av": loss_av.item(),
-                        "loss_tv": loss_tv.item(),
+                        "loss_av": av_loss.item() if av_loss is not None else 0.0,
+                        "loss_tv": tv_loss.item() if tv_loss is not None else 0.0,
                         "epoch": epoch,
                         "global_step": self.global_step,
+                        "training_phase": phase,
                         "lr_others": self.opt_others.param_groups[0]['lr'],
-                        "lr_audio":  self.opt_audio.param_groups[0]['lr'],
-                        "lr_text":   self.opt_text.param_groups[0]['lr'],
-                        "lr_vit":    self.opt_vit.param_groups[0]['lr'],
-                        "av_contrastive_loss": av_contrastive.item(),
-                        "av_reg_loss": av_reg.item(),
-                        "av_smooth_loss": av_smooth.item(),
+                        "lr_audio": self.opt_audio.param_groups[0]['lr'],
+                        "lr_text": self.opt_text.param_groups[0]['lr'],
+                        "lr_vit": self.opt_vit.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
                     }
 
-                    wandb_dict.update(av_sim_stats)
-                    wandb_dict.update(tv_sim_stats)
+                    # Add phase-specific metrics
+                    if phase != "tv_warmup":
+                        wandb_dict.update({
+                            "av_contrastive_loss": av_contrastive.item(),
+                            "av_reg_loss": av_reg.item(),
+                            "av_smooth_loss": av_smooth.item(),
+                        })
+                        wandb_dict.update(av_sim_stats)
+                    
+                    if phase != "av_focus":
+                        wandb_dict.update(tv_sim_stats)
+                    
+                    # Add weights during weighted joint phase
+                    if phase == "weighted_joint":
+                        wandb_dict.update({
+                            "av_weight": av_weight,
+                            "tv_weight": tv_weight,
+                        })
+                    
                     wandb.log(wandb_dict)
 
-                del frames_av, audio_av, frames_tv, texts_tv, loss_total
+                # Memory cleanup and management
+                memory_cleanup = []
+                if phase != "tv_warmup" and 'frames_av' in locals():
+                    memory_cleanup.extend(['frames_av', 'audio_av'])
+                if phase != "av_focus" and 'frames_tv' in locals():
+                    memory_cleanup.extend(['frames_tv', 'texts_tv'])
+                    
+                for var in memory_cleanup:
+                    if var in locals():
+                        del locals()[var]
+                del loss_total
                 torch.cuda.empty_cache()
+                
                 if self.global_step % 500 == 0:
                     gc.collect()
                 if (self.global_step > 0) and (self.global_step % self.vis_every == 0):
@@ -916,9 +1093,11 @@ class MultiModalTrainer:
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
-                if self.global_step > 0 and self.global_step%self.validation_frequency == 0:
-                    val_av_loss, val_tv_loss, val_total_loss = self.validate()
-                    print(f"Validation_Audio_Visual: {val_av_loss:.4f}, Validation_Text_Visual: {val_tv_loss:.4f}, Validation_Total: {val_total_loss:.4f}")
+                if self.global_step > 0 and self.global_step % self.validation_frequency == 0:
+                    val_av_loss, val_tv_loss, val_total_loss = self.validate(phase=phase)
+                    print(f"Validation_Audio_Visual: {val_av_loss:.4f if val_av_loss else 'N/A'}, "
+                          f"Validation_Text_Visual: {val_tv_loss:.4f if val_tv_loss else 'N/A'}, "
+                          f"Validation_Total: {val_total_loss:.4f if val_total_loss else 'N/A'}")
 
                 self.global_step += 1
                 
@@ -929,7 +1108,7 @@ class MultiModalTrainer:
             # Run validation at the end of each epoch if the frequency criteria is met
             if (self.val_av_dataloader or self.val_tv_dataloader):
                 self.logger.info(f"Running validation after epoch {epoch}...")
-                val_av_loss, val_tv_loss, val_total_loss = self.validate()
+                val_av_loss, val_tv_loss, val_total_loss = self.validate(phase=phase)
                 if val_total_loss is not None:
                     self.logger.info(f"Validation loss after epoch {epoch}: {val_total_loss:.4f}")
                     
@@ -940,8 +1119,6 @@ class MultiModalTrainer:
                         self.logger.info(f"New best model saved with val_loss: {val_total_loss:.4f}")
             
             # Reset batch index for the next epoch
-        
-
             self.current_batch_idx = 0
             self.save_checkpoint(epoch, self.global_step)
 
@@ -952,17 +1129,17 @@ class MultiModalTrainer:
 #        Main Script
 ###########################################
 if __name__ == "__main__":
-    print("Starting multi-modal training example with multiple schedulers...")
+    print("Starting multi-modal training with staged approach...")
 
     trainer = MultiModalTrainer(
         audio_visual_data_root="/home/cis/GodSet",
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-shewhipshebongshewhip",
+        output_dir="./outputs-staged-training",
         batch_size_av=22,
         batch_size_tv=22,
-        num_epochs=10,  
+        num_epochs=12,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
@@ -974,11 +1151,16 @@ if __name__ == "__main__":
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
-        project_name="TriadNerd",
+        project_name="TriadNerd-Staged",
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
         use_amp=True,
-        validation_frequency=10000
+        validation_frequency=10000,
+        av_focus_epochs=3,
+        tv_warmup_epochs=1,
+        weighted_joint_epochs=2,
+        av_weight_start=0.8,
+        av_weight_end=0.5,
     )
 
     trainer.train()
