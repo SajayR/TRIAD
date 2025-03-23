@@ -137,7 +137,7 @@ class ViTEmbedder(nn.Module):
         self.projection1 = nn.Linear(self.model.embed_dim, 512)
         self.layer_norm = nn.LayerNorm(512)
         self.projection2 = nn.Linear(512, embedding_dim)
-
+        self.dropout = nn.Dropout(dropout_prob)
         for param in self.model.parameters():
             param.requires_grad = True
         for param in self.projection1.parameters():
@@ -160,8 +160,9 @@ class ViTEmbedder(nn.Module):
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
-        feats = self.projection2(self.layer_norm(self.projection1(patches)))
         
+        feats = self.projection2(self.layer_norm(self.projection1(patches)))
+        feats = self.dropout(feats)
         return feats
 
 #################################################################
@@ -268,8 +269,8 @@ class MultiModalModel(nn.Module):
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(self.temperature), min=0) ** 2
         temp_high = torch.clamp(torch.log(self.temperature) 
-                                - torch.log(torch.tensor(2.5, device=token_sims.device)), min=0) ** 2
-        l_cal = temp_low + temp_high
+                                - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
+        l_cal = temp_low# + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
         reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.01 * l_smooth)

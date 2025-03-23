@@ -229,9 +229,9 @@ class MultiModalTrainer:
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=1.2,
-            patch_sparsity_threshold=1.5,
-            patch_sparsity_weight=0.5,
-            visual_dropout_prob=0.05,
+            patch_sparsity_threshold=0.80,
+            patch_sparsity_weight=0.01,
+            visual_dropout_prob=0.2,
             use_amp=use_amp
         ).to(self.device)
         #enabling gradient checkpointing
@@ -358,9 +358,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-uhoh", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-uhoh", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -959,10 +959,10 @@ if __name__ == "__main__":
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-railgun",
+        output_dir="./outputs-shewhipshebongshewhip",
         batch_size_av=22,
         batch_size_tv=22,
-        num_epochs=7,  
+        num_epochs=10,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,

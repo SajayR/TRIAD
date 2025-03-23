@@ -143,7 +143,7 @@ class AudioVisualizer:
                 ).overwrite_output()
                 stream.run(capture_stdout=True, capture_stderr=True)
                 Path(temp_video_path).unlink()
-                print(f"Saved attention video with original audio to {output_path}")
+                #print(f"Saved attention video with original audio to {output_path}")
             except ffmpeg.Error as e:
                 print("Error in ffmpeg muxing:", e.stderr.decode('utf8'))
                 print("Falling back to silent .mp4")
@@ -228,7 +228,7 @@ class AudioVisualizer:
         if output_path:
             plt.savefig(output_path)
             plt.close()
-            print(f"Saved audio attention snapshot to {output_path}")
+            #print(f"Saved audio attention snapshot to {output_path}")
         else:
             plt.show()
 
@@ -353,7 +353,7 @@ class TextVisualizer:
         if output_path:
             plt.savefig(output_path)
             plt.close()
-            print(f"Saved token attention figure to {output_path}")
+            #print(f"Saved token attention figure to {output_path}")
         else:
             plt.show()
 
