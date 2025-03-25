@@ -266,43 +266,43 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
-        audio_params = []
-        text_params  = []
-        vit_params   = []
-        others_params= []
+        self.audio_params = []
+        self.text_params  = []
+        self.vit_params   = []
+        self.others_params= []
         for name, param in self.model.named_parameters():
             if "audio_embedder.hubert" in name:
-                audio_params.append(param)
+                self.audio_params.append(param)
             elif "text_embedder.encoder" in name:
-                text_params.append(param)
+                self.text_params.append(param)
             elif "visual_embedder.model" in name:
-                vit_params.append(param)
+                self.vit_params.append(param)
             else:
-                others_params.append(param)
+                self.others_params.append(param)
 
         # (a) Optimizer for "others" (train from start)
         self.opt_others = torch.optim.AdamW(
-            others_params, lr=learning_rate
+            self.others_params, lr=learning_rate
         )
         # (b) Audio optimizer (frozen at start)
         self.opt_audio = torch.optim.AdamW(
-            audio_params, lr=learning_rate
+            self.audio_params, lr=learning_rate
         )
         # (c) Text optimizer
         self.opt_text = torch.optim.AdamW(
-            text_params, lr=learning_rate
+            self.text_params, lr=learning_rate
         )
         # (d) Vision optimizer
         self.opt_vit = torch.optim.AdamW(
-            vit_params, lr=learning_rate
+            self.vit_params, lr=learning_rate
         )
 
         # We'll freeze audio/text/vit from step=0:
-        for p in audio_params:
+        for p in self.audio_params:
             p.requires_grad = False
-        for p in text_params:
+        for p in self.text_params:
             p.requires_grad = False
-        for p in vit_params:
+        for p in self.vit_params:
             p.requires_grad = False
 
         # -----------------------------------------------------
@@ -941,6 +941,10 @@ class MultiModalTrainer:
 
             for batch_idx in pbar:
                 self._update_frozen_params(self.global_step)
+                grad_norm_others = None
+                grad_norm_audio = None
+                grad_norm_vit = None
+                grad_norm_text = None
                 
                 # Process Audio-Visual data (except in tv_warmup phase)
                 av_loss = av_contrastive = av_reg = av_smooth = None
@@ -992,8 +996,22 @@ class MultiModalTrainer:
                 accumulation_counter += 1
 
                 if (accumulation_counter % self.gradient_accumulation_steps) == 0:
-                    clip_grad_norm_(self.model.parameters(), 1.0)
+                    # Calculate gradient norm before clipping
+                    others_grads = [p.grad.norm() for p in self.others_params if p.grad is not None]
+                    audio_grads = [p.grad.norm() for p in self.audio_params if p.grad is not None]
+                    vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
+                    text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
 
+                    grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_audio = torch.norm(torch.stack(audio_grads)) if audio_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
+
+                    # Now do the actual clipping
+                    clip_grad_norm_(self.model.audio_embedder.parameters(), 10.0)
+                    clip_grad_norm_(self.model.visual_embedder.parameters(), 10.0)
+                    clip_grad_norm_(self.model.text_embedder.parameters(), 10.0)
+    
                     # ---- Step each optimizer *if* unfrozen. ----
                     # "Others" is always unfrozen
                     self.opt_others.step()
@@ -1051,6 +1069,16 @@ class MultiModalTrainer:
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
                     }
+                    
+                    # Add gradient norm to wandb logging if we just did an optimizer step
+                    if grad_norm_others is not None:
+                        wandb_dict["grad_norm_others"] = grad_norm_others.item()
+                    if grad_norm_audio is not None:
+                        wandb_dict["grad_norm_audio"] = grad_norm_audio.item()
+                    if grad_norm_vit is not None:
+                        wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    if grad_norm_text is not None:
+                        wandb_dict["grad_norm_text"] = grad_norm_text.item()
 
                     # Add phase-specific metrics
                     if phase != "tv_warmup":
@@ -1095,9 +1123,9 @@ class MultiModalTrainer:
                     self.save_checkpoint(epoch, self.global_step)
                 if self.global_step > 0 and self.global_step % self.validation_frequency == 0:
                     val_av_loss, val_tv_loss, val_total_loss = self.validate(phase=phase)
-                    print(f"Validation_Audio_Visual: {val_av_loss:.4f if val_av_loss else 'N/A'}, "
-                          f"Validation_Text_Visual: {val_tv_loss:.4f if val_tv_loss else 'N/A'}, "
-                          f"Validation_Total: {val_total_loss:.4f if val_total_loss else 'N/A'}")
+                    print(f"Validation_Audio_Visual: {f'{val_av_loss:.4f}' if val_av_loss is not None else 'N/A'}, "
+                          f"Validation_Text_Visual: {f'{val_tv_loss:.4f}' if val_tv_loss is not None else 'N/A'}, "
+                          f"Validation_Total: {f'{val_total_loss:.4f}' if val_total_loss is not None else 'N/A'}")
 
                 self.global_step += 1
                 
