@@ -14,7 +14,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 from torchvision import transforms
-
+import torch.nn as nn
 from dataset import (
     AudioVisualDataset, collate_fn,
     LocalCaptionDataset, FlatAudioVisualDataset
@@ -268,6 +268,7 @@ class MultiModalTrainer:
         # -----------------------------------------------------
         self.audio_params = []
         self.text_params  = []
+        self.vit_lora_params   = []
         self.vit_params   = []
         self.others_params= []
         for name, param in self.model.named_parameters():
@@ -275,10 +276,22 @@ class MultiModalTrainer:
                 self.audio_params.append(param)
             elif "text_embedder.encoder" in name:
                 self.text_params.append(param)
-            elif "visual_embedder.model" in name:
+            elif "visual_embedder.model" in name and "lora" in name:
+                self.vit_lora_params.append(param)
+            elif "visual_embedder.model" in name and "lora" not in name:
                 self.vit_params.append(param)
             else:
                 self.others_params.append(param)
+
+        print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
+        print(f"Number of ViT parameters: {len(self.vit_params)}")
+        # Only create the optimizer if we have parameters
+        if len(self.vit_lora_params) > 0:
+            print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
+            #self.opt_lora = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate * 2)
+        else:
+            print("WARNING: No LoRA parameters found! Check implementation.")
+            # Create dummy optimizer with a learnable parameter to avoid errors
 
         # (a) Optimizer for "others" (train from start)
         self.opt_others = torch.optim.AdamW(
@@ -294,7 +307,7 @@ class MultiModalTrainer:
         )
         # (d) Vision optimizer
         self.opt_vit = torch.optim.AdamW(
-            self.vit_params, lr=learning_rate
+            self.vit_lora_params, lr=learning_rate
         )
 
         # We'll freeze audio/text/vit from step=0:
@@ -302,6 +315,8 @@ class MultiModalTrainer:
             p.requires_grad = False
         for p in self.text_params:
             p.requires_grad = False
+        for p in self.vit_lora_params:
+            p.requires_grad = True
         for p in self.vit_params:
             p.requires_grad = False
 
@@ -382,9 +397,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -574,15 +589,6 @@ class MultiModalTrainer:
                 p.requires_grad = False
         else:
             for p in text_module.parameters():
-                p.requires_grad = True
-
-        # Vision
-        vision_module = self.model.visual_embedder.model
-        if current_step < self.config['unfreeze_vit_step']:
-            for p in vision_module.parameters():
-                p.requires_grad = False
-        else:
-            for p in vision_module.parameters():
                 p.requires_grad = True
 
 
@@ -945,6 +951,7 @@ class MultiModalTrainer:
                 grad_norm_audio = None
                 grad_norm_vit = None
                 grad_norm_text = None
+                grad_norm_vit_lora = None
                 
                 # Process Audio-Visual data (except in tv_warmup phase)
                 av_loss = av_contrastive = av_reg = av_smooth = None
@@ -1000,16 +1007,18 @@ class MultiModalTrainer:
                     others_grads = [p.grad.norm() for p in self.others_params if p.grad is not None]
                     audio_grads = [p.grad.norm() for p in self.audio_params if p.grad is not None]
                     vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
+                    vit_lora_grads = [p.grad.norm() for p in self.vit_lora_params if p.grad is not None]
                     text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
 
                     grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
                     grad_norm_audio = torch.norm(torch.stack(audio_grads)) if audio_grads else torch.tensor(0.0, device=self.device)
                     grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_vit_lora = torch.norm(torch.stack(vit_lora_grads)) if vit_lora_grads else torch.tensor(0.0, device=self.device)
                     grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
 
                     # Now do the actual clipping
                     clip_grad_norm_(self.model.audio_embedder.parameters(), 10.0)
-                    clip_grad_norm_(self.model.visual_embedder.parameters(), 10.0)
+                    #clip_grad_norm_(self.model.visual_embedder.parameters(), 10.0)
                     clip_grad_norm_(self.model.text_embedder.parameters(), 10.0)
     
                     # ---- Step each optimizer *if* unfrozen. ----
@@ -1041,15 +1050,14 @@ class MultiModalTrainer:
                     else:
                         self.opt_text.zero_grad()
 
-                    # Vision if current_step >= unfreeze_vit_step
-                    if self.global_step >= self.config['unfreeze_vit_step']:
-                        self.opt_vit.step()
-                        self.opt_vit.zero_grad()
-                        if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
-                            self.sched_vit.step()
-                            self.step_vit += 1
-                    else:
-                        self.opt_vit.zero_grad()
+                    # Always train VIT Lora
+                    
+                    self.opt_vit.step()
+                    self.opt_vit.zero_grad()
+                    if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
+                        self.sched_vit.step()
+                        self.step_vit += 1
+                    
                 
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
@@ -1077,6 +1085,8 @@ class MultiModalTrainer:
                         wandb_dict["grad_norm_audio"] = grad_norm_audio.item()
                     if grad_norm_vit is not None:
                         wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    if grad_norm_vit_lora is not None:
+                        wandb_dict["grad_norm_vit_lora"] = grad_norm_vit_lora.item()
                     if grad_norm_text is not None:
                         wandb_dict["grad_norm_text"] = grad_norm_text.item()
 
@@ -1164,10 +1174,10 @@ if __name__ == "__main__":
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-staged-training",
+        output_dir="./outputs-staged-training-shewhipsheregisterthekick",
         batch_size_av=22,
         batch_size_tv=22,
-        num_epochs=12,  
+        num_epochs=10,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
@@ -1175,7 +1185,7 @@ if __name__ == "__main__":
         save_every_steps=10000,
         num_workers=10,
         device="cuda",
-        gradient_accumulation_steps=3,
+        gradient_accumulation_steps=5,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
@@ -1184,7 +1194,7 @@ if __name__ == "__main__":
         num_vis_samples_tv=24,
         use_amp=True,
         validation_frequency=10000,
-        av_focus_epochs=3,
+        av_focus_epochs=2,
         tv_warmup_epochs=1,
         weighted_joint_epochs=2,
         av_weight_start=0.8,

@@ -14,6 +14,12 @@ warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.cuda.amp import autocast
+
+from peft import (
+    LoraConfig, 
+    get_peft_model,
+    TaskType,
+)
 #################################################################
 #                   Audio Embedder
 #################################################################
@@ -137,13 +143,57 @@ class ViTEmbedder(nn.Module):
         self.projection1 = nn.Linear(self.model.embed_dim, 512)
         self.layer_norm = nn.LayerNorm(512)
         self.projection2 = nn.Linear(512, embedding_dim)
-        self.dropout = nn.Dropout(dropout_prob)
+        #self.dropout = nn.Dropout(dropout_prob)
+        self.patch_dropout_rate = dropout_prob
+        self.patch_dropout = self.patch_dropout
         for param in self.model.parameters():
             param.requires_grad = True
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
             param.requires_grad = True
+
+    def patch_dropout(self, x, drop_rate):
+        """
+        Actually removes patch embeddings during training
+        Args:
+            x: patch embeddings of shape (B, N, D) where N is number of patches
+            drop_rate: probability of dropping a patch
+        """
+        if not self.training or drop_rate == 0:
+            return x
+            
+        B, N, D = x.shape
+        dtype = x.dtype
+            
+        # Create keep mask
+        keep_mask = torch.bernoulli(
+            torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
+        ).bool()
+        
+        # List to store processed batch items
+        output_tensors = []
+        
+        # Process each item in batch
+        for i in range(B):
+            # Select tokens to keep for this batch item
+            kept_tokens = x[i][keep_mask[i]]
+            output_tensors.append(kept_tokens)
+        
+        # Pad sequences to longest in batch
+        max_len = max(tensor.size(0) for tensor in output_tensors)
+        padded_outputs = []
+        
+        for tensor in output_tensors:
+            if tensor.size(0) < max_len:
+                padding = torch.zeros(max_len - tensor.size(0), D, dtype=dtype, device=x.device)
+                padded_outputs.append(torch.cat([tensor, padding], dim=0))
+            else:
+                padded_outputs.append(tensor)
+        
+        # Stack back into batch
+        x = torch.stack(padded_outputs, dim=0)
+        return x
 
     def forward(self, x):
         """
@@ -162,7 +212,135 @@ class ViTEmbedder(nn.Module):
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
         
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        feats = self.dropout(feats)
+        #feats = self.dropout(feats)
+        feats = self.patch_dropout(feats, self.patch_dropout_rate)
+        #print(f"feats shape: {feats.shape}")
+        return feats
+
+class ViTLoRAEmbedder(nn.Module):
+    """
+    DINOv2 with LoRA adapters for parameter-efficient fine-tuning.
+    Applies LoRA to both attention and MLP layers of the transformer.
+    Projects output embeddings to a common dimension with a linear layer.
+    """
+    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
+                 embedding_dim=512, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
+        super().__init__()
+        
+        # Load the base model
+        self.model = torch.hub.load(model_name, arch)
+        print(f"Using DINOv2 model with LoRA adapters: {arch}")
+    
+        
+        # Freeze the base model parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # Define which layers to apply LoRA to - now including both attention and MLP layers
+        lora_target_modules = [
+            # Attention layers
+            "attn.qkv",
+            "attn.proj",
+            # MLP layers
+            #"mlp.fc1",
+            #"mlp.fc2",
+        ]
+        
+        # LoRA configuration
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            inference_mode=False,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=0.0,
+            fan_in_fan_out=True,  # Add this
+            bias="none",          # Add this
+            modules_to_save=None  # Add this to prevent parameter duplication
+        )
+        
+        # Apply LoRA to the model
+        self.model = get_peft_model(self.model, lora_config)
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"ViTLoRAEmbedder - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
+
+        self.projection1 = nn.Linear(self.model.embed_dim, 512)
+        self.layer_norm = nn.LayerNorm(512)
+        self.projection2 = nn.Linear(512, embedding_dim)
+        self.patch_dropout_rate = dropout_prob
+        self.patch_dropout = self.patch_dropout
+        for param in self.model.parameters():
+            param.requires_grad = True
+        #set base model to false
+        for param in self.model.base_model.parameters():
+            param.requires_grad = False
+        for param in self.projection1.parameters():
+            param.requires_grad = True
+        for param in self.projection2.parameters():
+            param.requires_grad = True
+
+    def patch_dropout(self, x, drop_rate):
+        """
+        Actually removes patch embeddings during training
+        Args:
+            x: patch embeddings of shape (B, N, D) where N is number of patches
+            drop_rate: probability of dropping a patch
+        """
+        if not self.training or drop_rate == 0:
+            return x
+            
+        B, N, D = x.shape
+        dtype = x.dtype
+            
+        # Create keep mask
+        keep_mask = torch.bernoulli(
+            torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
+        ).bool()
+        
+        # List to store processed batch items
+        output_tensors = []
+        
+        # Process each item in batch
+        for i in range(B):
+            # Select tokens to keep for this batch item
+            kept_tokens = x[i][keep_mask[i]]
+            output_tensors.append(kept_tokens)
+        
+        # Pad sequences to longest in batch
+        max_len = max(tensor.size(0) for tensor in output_tensors)
+        padded_outputs = []
+        
+        for tensor in output_tensors:
+            if tensor.size(0) < max_len:
+                padding = torch.zeros(max_len - tensor.size(0), D, dtype=dtype, device=x.device)
+                padded_outputs.append(torch.cat([tensor, padding], dim=0))
+            else:
+                padded_outputs.append(tensor)
+        
+        # Stack back into batch
+        x = torch.stack(padded_outputs, dim=0)
+        return x
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 3, H, W), e.g. (B,3,224,224) image batch
+        Returns:
+            visual_feats: (B, Nv, D)
+                Nv = number of visual tokens
+                D  = embedding_dim
+        """
+        if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
+            x = x.squeeze(0)  # get [1, 3, 224, 224]
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
+            
+        # Use intermediate layers for feature extraction - same as original
+        patches = self.model.get_intermediate_layers(x, n=1)[0]
+        feats = self.projection2(self.layer_norm(self.projection1(patches)))
+        feats = self.patch_dropout(feats, self.patch_dropout_rate)
+        
         return feats
 
 #################################################################
@@ -183,9 +361,7 @@ class MultiModalModel(nn.Module):
 
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
-        self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14',
-                                           embedding_dim=512,
-                                           dropout_prob=visual_dropout_prob)
+        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
 
         self.temperature = nn.Parameter(torch.tensor(temperature))
 
@@ -504,7 +680,7 @@ if __name__ == "__main__":
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
-        visual_dropout_prob=0.1
+        visual_dropout_prob=0.2
     )
     batch_size = 2
     dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
