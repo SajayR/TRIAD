@@ -363,7 +363,11 @@ class MultiModalModel(nn.Module):
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
 
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        #self.temperature = nn.Parameter(torch.tensor(temperature))
+
+        self.temperature = nn.Parameter(torch.tensor(math.log(10.))) 
+        #self.t_prime = nn.Parameter(torch.tensor(math.log(10.)))
+        self.bias = nn.Parameter(torch.tensor(-10.))
 
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
@@ -385,7 +389,8 @@ class MultiModalModel(nn.Module):
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim / self.temperature
+            
+            return sim * self.temperature
 
     ######################################################
     #               AUDIO-VISUAL PATH
@@ -407,7 +412,7 @@ class MultiModalModel(nn.Module):
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         # dot product => (B, B, Na, Nv)
-        token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
+        token_sims = torch.matmul(af, vf.transpose(2, 3))
         # max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
         # mean over audio dimension => (B, B)
@@ -437,64 +442,50 @@ class MultiModalModel(nn.Module):
           2. Temperature constraints (optional if you're using a trainable temperature)
         """
         # 1) Non-negative pressure
-        neg_sims = torch.clamp(token_sims, min=-60, max=0)
+        neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims ** 2)
 
         # 2) Temperature calibration
         #    force it between [1,4] or sumn man idk.
-        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
-                               - torch.log(self.temperature), min=0) ** 2
-        temp_high = torch.clamp(torch.log(self.temperature) 
-                                - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
-        l_cal = temp_low# + temp_high
+        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) - torch.log(self.temperature), min=0) ** 2
+        temp_high = torch.clamp(torch.log(self.temperature) - torch.log(torch.tensor(4.0, device=token_sims.device)), min=0) ** 2
+        l_cal = temp_low + temp_high
 
-        l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.01 * l_smooth)
-        return reg_loss, 0.01*l_smooth
+        #l_smooth = self.compute_temporal_smoothness_loss(token_sims)
+        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg)# + 0.01 * l_smooth)
+        return reg_loss, torch.tensor(0.00, device=token_sims.device)#*l_smooth
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
         B = clip_sims.shape[0]
-        labels = torch.arange(B, device=clip_sims.device)
         
-        # Extract positive and negative similarities
-        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+        # Create labels: +1 for positives (diagonal), -1 for negatives
+        labels = -torch.ones_like(clip_sims)
+        labels.fill_diagonal_(1)
         
-        # Create a mask for negative pairs (all except diagonal)
+        # Apply temperature and bias
+        logits = clip_sims * self.temperature + self.bias
+        
+        # Compute sigmoid loss
+        loss = -torch.mean(F.logsigmoid(labels * logits))
+        
+        # Keep tracking statistics for monitoring
+        pos_sims = torch.diagonal(clip_sims)
         mask = torch.ones_like(clip_sims, dtype=torch.bool)
         mask.fill_diagonal_(0)
-        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        neg_sims = clip_sims[mask]
         
-        # Compute statistics
-        pos_sim_mean = pos_sims.mean().item()
-        pos_sim_std = pos_sims.std().item()
-        neg_sim_mean = neg_sims.mean().item()
-        neg_sim_std = neg_sims.std().item()
-        hardest_negative = neg_sims.max().item()
-        
-        # Calculate separation (gap between positive and negative means)
-        separation = pos_sim_mean - neg_sim_mean
-        
-        # Original contrastive loss calculation
-        log_prob_a2v = F.log_softmax(clip_sims, dim=1)
-        losses_a2v = -log_prob_a2v[torch.arange(B), labels]
-
-        log_prob_v2a = F.log_softmax(clip_sims.t(), dim=1)
-        losses_v2a = -log_prob_v2a[torch.arange(B), labels]
-
-        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
-        reg_loss, l_smooth = self.compute_regularization_losses_av(token_sims)
-        
-        # Return similarity stats along with losses
         similarity_stats = {
-            "av_pos_sim_mean": pos_sim_mean,
-            "av_pos_sim_std": pos_sim_std,
-            "av_neg_sim_mean": neg_sim_mean,
-            "av_neg_sim_std": neg_sim_std,
-            "av_separation": separation,
-            "av_hardest_negative": hardest_negative
+            "av_pos_sim_mean": pos_sims.mean().item(),
+            "av_pos_sim_std": pos_sims.std().item(),
+            "av_neg_sim_mean": neg_sims.mean().item(),
+            "av_neg_sim_std": neg_sims.std().item(),
+            "av_separation": (pos_sims.mean() - neg_sims.mean()).item(),
+            "av_hardest_negative": neg_sims.max().item()
         }
         
-        return contrastive_loss + reg_loss, contrastive_loss, reg_loss, l_smooth, similarity_stats
+        reg_loss, l_smooth = self.compute_regularization_losses_av(token_sims)
+        
+        return loss + reg_loss, loss, reg_loss, l_smooth, similarity_stats
 
     def forward_audio_visual(self, frames, audio):
         """
@@ -531,7 +522,7 @@ class MultiModalModel(nn.Module):
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
         # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature
+        token_sims = torch.matmul(tf, vf.transpose(2, 3))
         # max over visual dimension => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
         # we need masked mean over Nt
@@ -572,55 +563,37 @@ class MultiModalModel(nn.Module):
         return reg_loss
 
     def compute_contrastive_loss_tv(self, clip_sims, token_sims):
-        """
-        Standard cross-entropy for text<->visual plus the reg losses,
-        now with similarity statistics tracking.
-        """
         B = clip_sims.shape[0]
-        labels = torch.arange(B, device=clip_sims.device)
         
-        # Extract positive and negative similarities
-        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+        # Create labels: +1 for positives (diagonal), -1 for negatives
+        labels = -torch.ones_like(clip_sims)
+        labels.fill_diagonal_(1)
         
-        # Create a mask for negative pairs (all except diagonal)
+        # Apply temperature and bias
+        logits = clip_sims * self.temperature + self.bias
+        
+        # Main sigmoid loss
+        loss = -torch.mean(F.logsigmoid(labels * logits))
+        
+        # Keep tracking statistics
+        pos_sims = torch.diagonal(clip_sims)
         mask = torch.ones_like(clip_sims, dtype=torch.bool)
         mask.fill_diagonal_(0)
-        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        neg_sims = clip_sims[mask]
         
-        # Compute statistics
-        pos_sim_mean = pos_sims.mean().item()
-        pos_sim_std = pos_sims.std().item()
-        neg_sim_mean = neg_sims.mean().item()
-        neg_sim_std = neg_sims.std().item()
-        hardest_negative = neg_sims.max().item()
-        
-        # Calculate separation (gap between positive and negative means)
-        separation = pos_sim_mean - neg_sim_mean
-        
-        # Original contrastive loss calculation
-        # text->visual
-        log_prob_t2v = F.log_softmax(clip_sims, dim=1)
-        losses_t2v = -log_prob_t2v[torch.arange(B), labels]
+        similarity_stats = {
+            "tv_pos_sim_mean": pos_sims.mean().item(),
+            "tv_pos_sim_std": pos_sims.std().item(),
+            "tv_neg_sim_mean": neg_sims.mean().item(),
+            "tv_neg_sim_std": neg_sims.std().item(),
+            "tv_separation": (pos_sims.mean() - neg_sims.mean()).item(),
+            "tv_hardest_negative": neg_sims.max().item()
+        }
 
-        # visual->text
-        log_prob_v2t = F.log_softmax(clip_sims.t(), dim=1)
-        losses_v2t = -log_prob_v2t[torch.arange(B), labels]
-
-        contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
         reg_loss = self.compute_regularization_losses_tv(token_sims)
 
-        total_loss = contrastive_loss + reg_loss
-        
-        # Return similarity stats along with losses
-        similarity_stats = {
-            "tv_pos_sim_mean": pos_sim_mean,
-            "tv_pos_sim_std": pos_sim_std,
-            "tv_neg_sim_mean": neg_sim_mean,
-            "tv_neg_sim_std": neg_sim_std,
-            "tv_separation": separation,
-            "tv_hardest_negative": hardest_negative
-        }
-        
+        total_loss = loss + reg_loss
+
         return total_loss, similarity_stats
 
     def forward_text_visual(self, frames, text_list):

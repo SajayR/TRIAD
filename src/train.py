@@ -397,9 +397,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers-sigmoidloss-smoothless", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers-sigmoidloss-smoothless", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -1076,6 +1076,7 @@ class MultiModalTrainer:
                         "lr_text": self.opt_text.param_groups[0]['lr'],
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
+                        "bias": self.model.bias.item(),
                     }
                     
                     # Add gradient norm to wandb logging if we just did an optimizer step
@@ -1174,7 +1175,7 @@ if __name__ == "__main__":
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-staged-training-shewhipsheregisterthekick",
+        output_dir="./outputs-staged-training-shewhipshenerdyasfuckwithsigmoid",
         batch_size_av=22,
         batch_size_tv=22,
         num_epochs=10,  
