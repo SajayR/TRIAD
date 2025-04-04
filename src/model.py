@@ -59,7 +59,7 @@ def logsumexp_pool(token_sims: torch.Tensor, tau: float) -> torch.Tensor:
 #                   Audio Embedder
 #################################################################
 class AudioEmbedder(nn.Module):
-    def __init__(self, embedding_dim=512, hubert_name="facebook/hubert-base-ls960"):
+    def __init__(self, embedding_dim=384, hubert_name="facebook/hubert-base-ls960"):
         super().__init__()
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")  
         self.hubert = HubertModel.from_pretrained(hubert_name)
@@ -82,7 +82,7 @@ class AudioEmbedder(nn.Module):
             return_tensors="pt",
             sampling_rate=16000,
             padding=True,
-            return_attention_mask=True
+            return_attention_mask=True,
         ).input_values.squeeze(0)
         device = next(self.parameters()).device
         inputs = inputs.to(device)
@@ -97,7 +97,7 @@ class AudioEmbedder(nn.Module):
 #                   Text Embedder
 #################################################################
 class TextEmbedder(nn.Module):
-    def __init__(self, embedding_dim=512, model_name="distilbert/distilbert-base-uncased"):
+    def __init__(self, embedding_dim=384, model_name="distilbert/distilbert-base-uncased"):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
@@ -118,7 +118,7 @@ class TextEmbedder(nn.Module):
             padding=True,
             truncation=True,
             add_special_tokens=False,
-            max_length=128,
+            max_length=64,
             return_tensors="pt"
         )
         device = next(self.parameters()).device
@@ -137,7 +137,7 @@ class TextEmbedder(nn.Module):
 #################################################################
 class ViTLoRAEmbedder(nn.Module):
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=512, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
+                 embedding_dim=384, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
         super().__init__()
         # Load the base DINOv2
         self.model = torch.hub.load(model_name, arch)
@@ -463,7 +463,7 @@ if __name__ == "__main__":
     model = MultiModalModel(
         audio_model_name="facebook/hubert-base-ls960",
         text_model_name="distilbert/distilbert-base-uncased",
-        temperature=2.0,
+        aggregator_temp=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.2
