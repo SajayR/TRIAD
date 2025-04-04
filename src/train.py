@@ -94,6 +94,10 @@ class MultiModalTrainer:
         weighted_joint_epochs: int = 2,
         av_weight_start: float = 0.8,
         av_weight_end: float = 0.5,
+        # New temperature scheduling parameters
+        aggregator_temp_start: float = 4.0,
+        aggregator_temp_end: float = 0.1,
+        aggregator_temp_steps: int = 150000,
     ):
         """
         Args:
@@ -112,6 +116,8 @@ class MultiModalTrainer:
             weighted_joint_epochs: number of epochs to gradually shift from AV to balanced
             av_weight_start: starting weight for AV loss in weighted joint phase
             av_weight_end: ending weight for AV loss in weighted joint phase
+            aggregator_temp_start: starting temperature for the aggregator (higher = softer attention)
+            aggregator_temp_end: ending temperature for the aggregator (lower = harder attention)
         """
         self.device = device
         self.output_dir = Path(output_dir)
@@ -131,6 +137,11 @@ class MultiModalTrainer:
         self.av_weight_start = av_weight_start
         self.av_weight_end = av_weight_end
         
+        # Store temperature scheduling parameters
+        self.aggregator_temp_start = aggregator_temp_start
+        self.aggregator_temp_end = aggregator_temp_end
+        self.aggregator_temp_steps = aggregator_temp_steps
+        
         self.config = {
             "batch_size_av": batch_size_av,
             "batch_size_tv": batch_size_tv,
@@ -147,7 +158,10 @@ class MultiModalTrainer:
             "tv_warmup_epochs": tv_warmup_epochs,
             "weighted_joint_epochs": weighted_joint_epochs,
             "av_weight_start": av_weight_start,
-            "av_weight_end": av_weight_end
+            "av_weight_end": av_weight_end,
+            "aggregator_temp_start": aggregator_temp_start,
+            "aggregator_temp_end": aggregator_temp_end,
+            "aggregator_temp_steps": aggregator_temp_steps
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -252,7 +266,7 @@ class MultiModalTrainer:
             audio_model_name="facebook/hubert-base-ls960",
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
-            temperature=1.5,
+            aggregator_temp=self.aggregator_temp_start,  # Set initial temperature
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.01,
             visual_dropout_prob=0.25,
@@ -398,9 +412,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-lora-registers-rank8", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-logexp-temp", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-lora-registers-rank8", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-logexp-temp", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -434,6 +448,30 @@ class MultiModalTrainer:
 
         return max(ckpts, key=_parse_ckpt_name)
 
+    def get_aggregator_temp(self, current_step):
+        """
+        Exponential schedule from aggregator_temp_start down to aggregator_temp_end.
+        
+        Args:
+            current_step: Current training step
+            
+        Returns:
+            Temperature value for the current step based on exponential decay
+        """
+        if current_step >= self.aggregator_temp_steps:
+            return self.aggregator_temp_end
+        
+        alpha = current_step / self.aggregator_temp_steps  # goes 0->1
+        # Exponential decay:
+        # T(step) = T_start * (T_end/T_start)^alpha
+        temp = self.aggregator_temp_start * (self.aggregator_temp_end / self.aggregator_temp_start) ** alpha
+        
+        # Log temperature changes periodically or at significant milestones
+        if current_step % 500 == 0 or alpha in [0.25, 0.5, 0.75]:
+            self.logger.info(f"Step {current_step}/{self.aggregator_temp_steps}: aggregator_temp = {temp:.4f}")
+            
+        return temp
+
     def save_checkpoint(self, epoch, step, is_best=False):
         ckpt_path = self.output_dir / f"checkpoint_epoch{epoch}_step{step}.pt"
         rng_state = {
@@ -465,7 +503,10 @@ class MultiModalTrainer:
             "best_loss": self.best_loss,
             "config": self.config,
             "vis_samples_av": self.vis_samples_av,
-            "vis_samples_tv": self.vis_samples_tv
+            "vis_samples_tv": self.vis_samples_tv,
+            "aggregator_temp_start": self.aggregator_temp_start,
+            "aggregator_temp_end": self.aggregator_temp_end,
+            "current_aggregator_temp": self.model.aggregator_temp if hasattr(self.model, "aggregator_temp") else None
         }
         torch.save(ckpt, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
@@ -510,7 +551,7 @@ class MultiModalTrainer:
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         self.av_dataset.current_segment = ck["current_segment"]
-
+        
         # Check for phase configuration differences
         ckpt_config = ck.get("config", {})
         ckpt_av_focus = ckpt_config.get("av_focus_epochs", self.av_focus_epochs)
@@ -536,6 +577,22 @@ class MultiModalTrainer:
                     f"Total phase duration differs: checkpoint={total_phases_ckpt}, current={total_phases_current}. "
                     f"This may affect training continuity."
                 )
+        
+        # Load temperature scheduling parameters if available
+        self.aggregator_temp_start = ck.get("aggregator_temp_start", self.aggregator_temp_start)
+        self.aggregator_temp_end = ck.get("aggregator_temp_end", self.aggregator_temp_end)
+        
+        # If the model has a temperature attribute, set it based on the checkpoint
+        # or calculate it based on the current step
+        if hasattr(self.model, "aggregator_temp"):
+            current_temp = ck.get("current_aggregator_temp")
+            if current_temp is not None:
+                self.model.aggregator_temp = current_temp
+            else:
+                # Calculate the temperature based on the current step
+                calculated_temp = self.get_aggregator_temp(self.global_step)
+                self.model.aggregator_temp = calculated_temp
+                self.logger.info(f"Setting aggregator_temp to {calculated_temp} based on step {self.global_step}")
 
         rng_state = ck.get("rng_state", None)
         if rng_state is not None:
@@ -782,6 +839,10 @@ class MultiModalTrainer:
             return None, None, None
             
         self.model.eval()
+        
+        # Store the current aggregator temperature
+        current_temp = self.model.aggregator_temp if hasattr(self.model, "aggregator_temp") else None
+        
         av_losses = []
         tv_losses = []
         av_contrastive_losses = []
@@ -858,6 +919,9 @@ class MultiModalTrainer:
                 "global_step": self.global_step,
                 "validation_phase": phase
             }
+            
+            if current_temp is not None:
+                wandb_dict["aggregator_temp"] = current_temp
             
             if avg_av_loss is not None:
                 wandb_dict["val_loss_av"] = avg_av_loss
@@ -993,6 +1057,12 @@ class MultiModalTrainer:
             for batch_idx in pbar:
                 #self.eval_1000_way_retrieval()
                 self._update_frozen_params(self.global_step)
+                
+                # Calculate and update aggregator temperature
+                current_temp = self.get_aggregator_temp(self.global_step)
+                if hasattr(self.model, "aggregator_temp"):
+                    self.model.aggregator_temp = current_temp
+                
                 grad_norm_others = None
                 grad_norm_audio = None
                 grad_norm_vit = None
@@ -1009,11 +1079,19 @@ class MultiModalTrainer:
                         print("StopIteration in av_iter")
                         self.av_iter = iter(self.av_dataloader)
                         av_batch = next(self.av_iter)
-                    frames_av = av_batch['frame'].to(self.device)
-                    audio_av = av_batch['audio'].to(self.device)
                     
-                    av_loss, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
-                
+                    try:
+                        frames_av = av_batch['frame'].to(self.device)
+                        audio_av = av_batch['audio'].to(self.device)
+                        av_loss, av_contrastive, av_reg, av_smooth, av_sim_stats = self.model.forward_audio_visual(frames_av, audio_av)
+                    except torch.cuda.OutOfMemoryError:
+                        print("OOM in audio-visual forward pass, clearing cache and skipping batch")
+                        if 'frames_av' in locals(): del frames_av
+                        if 'audio_av' in locals(): del audio_av
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
+
                 # Process Text-Visual data (except in av_focus phase)
                 tv_loss = None
                 tv_sim_stats = {}
@@ -1024,10 +1102,17 @@ class MultiModalTrainer:
                         print("StopIteration in tv_iter")
                         self.tv_iter = iter(self.tv_dataloader)
                         tv_batch = next(self.tv_iter)
-                    frames_tv = tv_batch['images'].to(self.device)
-                    texts_tv = tv_batch['captions']
-                    
-                    tv_loss, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+                    try:
+                        frames_tv = tv_batch['images'].to(self.device)
+                        texts_tv = tv_batch['captions']
+                        tv_loss, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+                    except torch.cuda.OutOfMemoryError:
+                        print("OOM in text-visual forward pass, clearing cache and skipping batch")
+                        if 'frames_tv' in locals(): del frames_tv
+                        if 'texts_tv' in locals(): del texts_tv
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
                 
                 # Calculate total loss based on current phase
                 if phase == "av_focus":
@@ -1121,7 +1206,7 @@ class MultiModalTrainer:
                         "lr_audio": self.opt_audio.param_groups[0]['lr'],
                         "lr_text": self.opt_text.param_groups[0]['lr'],
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
-                        "temperature": self.model.temperature.item(),
+                        "aggregator_temp": current_temp,
                     }
                     
                     # Add gradient norm to wandb logging if we just did an optimizer step
@@ -1141,7 +1226,7 @@ class MultiModalTrainer:
                         wandb_dict.update({
                             "av_contrastive_loss": av_contrastive.item(),
                             "av_reg_loss": av_reg.item(),
-                            "av_smooth_loss": av_smooth.item(),
+                            #"av_smooth_loss": av_smooth.item(),
                         })
                         wandb_dict.update(av_sim_stats)
                     
@@ -1152,6 +1237,7 @@ class MultiModalTrainer:
                     if phase == "weighted_joint":
                         wandb_dict.update({
                             "av_weight": av_weight,
+
                             "tv_weight": tv_weight,
                         })
                     
@@ -1224,9 +1310,9 @@ if __name__ == "__main__":
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-revamped",#"./outputs-staged-training-shewhipsheregisterthelowrank",
-        batch_size_av=22,
-        batch_size_tv=22,
+        output_dir="./outputs-revamped-logexp",#"./outputs-staged-training-shewhipsheregisterthelowrank",
+        batch_size_av=32,
+        batch_size_tv=32,
         num_epochs=10,  
         learning_rate=1e-4,
         use_wandb=True,
@@ -1235,20 +1321,23 @@ if __name__ == "__main__":
         save_every_steps=10000,
         num_workers=10,
         device="cuda",
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
-        project_name="TriadNerd-Staged",
-        num_vis_samples_av=24,
-        num_vis_samples_tv=24,
+        project_name="TriadNerd-Logexp",
+        num_vis_samples_av=32,
+        num_vis_samples_tv=32,
         use_amp=True,
         validation_frequency=20000,
-        av_focus_epochs=1,
-        tv_warmup_epochs=1,
+        av_focus_epochs=0,
+        tv_warmup_epochs=0,
         weighted_joint_epochs=2,
         av_weight_start=0.8,
         av_weight_end=0.5,
+        aggregator_temp_start=5.0,
+        aggregator_temp_end=0.05,
+        aggregator_temp_steps=100000
     )
 
     trainer.train()
