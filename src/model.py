@@ -224,7 +224,7 @@ class ViTLoRAEmbedder(nn.Module):
     Projects output embeddings to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=512, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
+                 embedding_dim=512, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
         super().__init__()
         
         # Load the base model
@@ -362,7 +362,7 @@ class MultiModalModel(nn.Module):
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
-
+        #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
 
         self.patch_sparsity_threshold = patch_sparsity_threshold
@@ -385,7 +385,7 @@ class MultiModalModel(nn.Module):
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim / self.temperature
+            return sim * self.temperature
 
     ######################################################
     #               AUDIO-VISUAL PATH
@@ -407,7 +407,7 @@ class MultiModalModel(nn.Module):
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
         # dot product => (B, B, Na, Nv)
-        token_sims = torch.matmul(af, vf.transpose(2, 3)) / self.temperature
+        token_sims = torch.matmul(af, vf.transpose(2, 3)) * self.temperature
         # max over visual dimension => (B, B, Na)
         max_sims = torch.max(token_sims, dim=3)[0]
         # mean over audio dimension => (B, B)
@@ -449,7 +449,7 @@ class MultiModalModel(nn.Module):
         l_cal = temp_low# + temp_high
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
-        reg_loss = (0.9 * l_cal + 0.15 * l_nonneg + 0.01 * l_smooth)
+        reg_loss = (20 * l_cal + 0.15 * l_nonneg + 0.01 * l_smooth)
         return reg_loss, 0.01*l_smooth
 
     def compute_contrastive_loss_av(self, clip_sims, token_sims):
@@ -531,7 +531,7 @@ class MultiModalModel(nn.Module):
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
         # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) / self.temperature
+        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
         # max over visual dimension => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
         # we need masked mean over Nt

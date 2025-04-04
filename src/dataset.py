@@ -14,9 +14,10 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision import transforms
 from typing import Dict, List
-
+import torchaudio
 warnings.filterwarnings("ignore")
-
+from torchcodec.decoders import VideoDecoder
+import random
 try:
     multiprocessing.set_start_method('fork', force=True)
 except:
@@ -29,13 +30,17 @@ class LocalCaptionDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
         self.root_dir = Path(root_dir)
         self.transform = transform or transforms.Compose([
+            # Geometric transformations (on PIL image)
             transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)), # Small translations
+            # Convert to tensor (0-1 range)
             transforms.ToTensor(),
-            #transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Random erasing for robustness
+            # Color transformations (on tensor)
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            # Normalize with ImageNet stats
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                             std=[0.229, 0.224, 0.225])
+            #transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Optional: Random erasing at the end
         ])
         
         # Clean transform for visualization
@@ -73,107 +78,64 @@ class LocalCaptionDataset(Dataset):
             return torch.zeros((3, 224, 224)), ""
 
 
+
 def extract_audio_from_video(video_path: Path) -> torch.Tensor:
-    """Extract entire 1s audio from video."""
-    container = None
     try:
-        container = av.open(str(video_path))
-        audio = container.streams.audio[0]
-        resampler = av.audio.resampler.AudioResampler(format='s16', layout='mono', rate=16000)
-        
-        samples = []
-        for frame in container.decode(audio):
-            frame.pts = None
-            resampled = resampler.resample(frame)
-            if resampled:  
-                frame = resampled[0]
-                samples.append(frame.to_ndarray().reshape(-1))
-
-        if not samples:  
-            return torch.zeros(16331)
-
-        samples = torch.tensor(np.concatenate(samples))
-        samples = samples.float() / 32768.0  
-        return samples
+        waveform, sample_rate = torchaudio.load(video_path)
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+        return waveform[0]
     except Exception as e:
-        print(f"Failed to load audio from {video_path}: {str(e)}")
+        print(f"Failed to load audio with torchaudio from {video_path}: {str(e)}")
         return torch.zeros(16331)
-    finally:
-        if container:
-            container.close()
+
 
 
 def load_and_preprocess_video(video_path: str, sample_fps: int, apply_augmentation=True) -> torch.Tensor:
-    """Load only one random frame from the 1s video using PyAV, resize, and normalize."""
-    container = av.open(video_path)
-    video_stream = container.streams.video[0]
-    original_fps = float(video_stream.average_rate)
-    video_duration = 1.0
-    num_original_frames = int(round(original_fps * video_duration))
-    desired_frame_count = int(video_duration * sample_fps)  # equals sample_fps
-    frame_indices = np.linspace(0, num_original_frames - 1, desired_frame_count, dtype=int)
-    chosen_index = frame_indices[np.random.randint(0, desired_frame_count)]
-    chosen_time_seconds = chosen_index / original_fps
-    chosen_pts = int(chosen_time_seconds / video_stream.time_base)
-
-    container.seek(chosen_pts, stream=video_stream, any_frame=False, backward=True)
-    closest_frame = None
-    min_pts_diff = float('inf')
-    for frame in container.decode(video_stream):
-        pts_diff = abs(frame.pts - chosen_pts)
-        if pts_diff < min_pts_diff:
-            min_pts_diff = pts_diff
-            closest_frame = frame
-        # gone too far past our target, stop
-        if frame.pts > chosen_pts + original_fps/10:  # 1/10th second overshoot
-            break
-    
-    container.close()
-    if closest_frame is None:
-        raise ValueError(f"Failed to find appropriate frame for index {chosen_index}")
-    decoded_frame = closest_frame.to_rgb().to_ndarray()
-    frame_tensor = torch.from_numpy(decoded_frame).permute(2, 0, 1).float() / 255.0
-    
-    # Resize first to 256x256 to allow for random cropping
+    decoder = VideoDecoder(source=video_path)
+    num_total_frames = decoder.metadata.num_frames
+    frame_index = random.randint(0, num_total_frames - 1)
+    frame = decoder[frame_index]
+    frame = frame.float() / 255.0
+    #print(f"Frame tensor shape: {frame.shape}")
     frame_tensor = torch.nn.functional.interpolate(
-        frame_tensor.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
-    ).squeeze(0)
+            frame.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False
+            ).squeeze(0)
+    
+    # frame tensor at this point is (3, 224, 224)
     
     if apply_augmentation:
-        # Apply random augmentations
-        # Random crop
-        i, j, h, w = transforms.RandomCrop.get_params(frame_tensor, output_size=(224, 224))
-        frame_tensor = frame_tensor[:, i:i+h, j:j+w]
+        # Horizontal flip with 50% probability
+        if random.random() < 0.5:
+            frame_tensor = frame_tensor.flip(dims=[2])
         
-        # Random horizontal flip
-        if random.random() > 0.5:
-            frame_tensor = torch.flip(frame_tensor, [2])
+        # Color jitter
+        if random.random() < 0.8:
+            # Brightness adjustment
+            brightness_factor = random.uniform(0.6, 1.4)
+            frame_tensor = frame_tensor * brightness_factor
             
-        # Color jitter (manually applying since we're using tensors)
-        if random.random() > 0.5:
-            brightness = random.uniform(0.8, 1.2)
-            contrast = random.uniform(0.8, 1.2)
-            saturation = random.uniform(0.8, 1.2)
+            # Contrast adjustment
+            if random.random() < 0.5:
+                contrast_factor = random.uniform(0.6, 1.4)
+                mean = torch.mean(frame_tensor, dim=[1, 2], keepdim=True)
+                frame_tensor = (frame_tensor - mean) * contrast_factor + mean
             
-            # Apply brightness
-            frame_tensor = frame_tensor * brightness
-            
-            # Apply contrast
-            mean = torch.mean(frame_tensor, dim=[1, 2], keepdim=True)
-            frame_tensor = (frame_tensor - mean) * contrast + mean
-            
-            # Apply saturation (simplified)
-            grayscale = torch.mean(frame_tensor, dim=0, keepdim=True).repeat(3, 1, 1)
-            frame_tensor = frame_tensor * saturation + grayscale * (1 - saturation)
+            # Saturation adjustment (assuming RGB input)
+            if random.random() < 0.5:
+                saturation_factor = random.uniform(0.6, 1.4)
+                gray = frame_tensor.mean(dim=0, keepdim=True)
+                gray = gray.expand_as(frame_tensor)
+                frame_tensor = frame_tensor * saturation_factor + gray * (1 - saturation_factor)
+
     else:
-        # Simple center crop for visualization
-        frame_tensor = transforms.functional.center_crop(frame_tensor, (224, 224))
-    
-    # Clamp values to be in valid range [0, 1]
+        frame_tensor = frame_tensor
+        
+    # Ensure values stay in [0, 1] range
     frame_tensor = torch.clamp(frame_tensor, 0, 1)
-    
-    # Apply normalization
     frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
+        
     return frame_tensor
 
 class VideoBatchSampler(Sampler):  #point is to sample videos with different vid_nums in a batch
@@ -317,8 +279,6 @@ def collate_fn(batch):
     return {
         'frame': video_tokens,
         'audio': audio_padded,
-        #'vid_nums': [item['vid_num'] for item in batch],
-        #'segment_nums': [item['segment_num'] for item in batch],
         'video_paths': [str(item['video_path']) for item in batch]
     }
 

@@ -21,7 +21,7 @@ from dataset import (
 )
 from model import MultiModalModel
 from viz import AudioVisualizer, TextVisualizer
-
+from retrieval import compute_av_retrieval_metrics, compute_tv_retrieval_metrics
 warnings.filterwarnings("ignore")
 
 
@@ -252,10 +252,10 @@ class MultiModalTrainer:
             audio_model_name="facebook/hubert-base-ls960",
             # text_model_name="answerdotai/ModernBERT-base",
             text_model_name="distilbert/distilbert-base-uncased",
-            temperature=1.2,
+            temperature=1.5,
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.01,
-            visual_dropout_prob=0.2,
+            visual_dropout_prob=0.25,
             use_amp=use_amp
         ).to(self.device)
         #enabling gradient checkpointing
@@ -308,6 +308,7 @@ class MultiModalTrainer:
         # (d) Vision optimizer
         self.opt_vit = torch.optim.AdamW(
             self.vit_lora_params, lr=learning_rate
+            #self.vit_params, lr=learning_rate
         )
 
         # We'll freeze audio/text/vit from step=0:
@@ -341,7 +342,7 @@ class MultiModalTrainer:
         audio_cycle = max(1, self.total_updates - unfreeze_audio_step)
         self.sched_audio = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_audio,
-            max_lr=learning_rate*0.75,
+            max_lr=learning_rate*0.25,
             total_steps=audio_cycle,
             pct_start=0.1,
             div_factor=10,
@@ -363,7 +364,7 @@ class MultiModalTrainer:
         vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
         self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_vit,
-            max_lr=learning_rate*0.3,
+            max_lr=learning_rate*0.5,
             total_steps=vit_cycle,
             pct_start=0.1,
             div_factor=10,
@@ -397,9 +398,9 @@ class MultiModalTrainer:
             elif self.use_wandb:
                 print("No checkpoint found")
         elif self.use_wandb and force_new_training:
-            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers-rank8", config=self.config)
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-lora-registers", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-lora-registers-rank8", config=self.config)
 
         # Visualization
         self.audio_viz = AudioVisualizer()
@@ -709,7 +710,7 @@ class MultiModalTrainer:
                         frame=frame,
                         audio=audio,
                         output_path=str(out_file_img),
-                        num_tokens_to_show=5
+                        num_tokens_to_show=10
                     )
                     out_file_vid = self.output_dir / f"av_viz_epoch{epoch}_sample{i}.mp4"
                     self.audio_viz.make_attention_video(
@@ -883,14 +884,58 @@ class MultiModalTrainer:
         self.model.train()
         
         return avg_av_loss, avg_tv_loss, val_total_loss
+    
+
+    def eval_1000_way_retrieval(self):
+        """
+        1000-way retrieval across audio/visual and text/visual subsets.
+        """
+        if not self.val_av_dataset and not self.val_tv_dataset:
+            self.logger.info("No 1000-way retrieval possible, no validation sets loaded.")
+            return
+
+        self.logger.info("Starting 1000-way retrieval evaluation...")
+
+        # Audio->Video
+        if self.val_av_dataset:
+            av_results = compute_av_retrieval_metrics(
+                model=self.model,
+                dataset=self.val_av_dataset,
+                subset_file=str(self.output_dir / "subset_av_1000.json"),
+                device=self.device
+            )
+            self.logger.info(f"A/V 1000-way retrieval:\n{av_results}")
+            # Optionally log to wandb
+            if self.use_wandb:
+                wandb_dict = {}
+                for k, v in av_results.items():
+                    wandb_dict[f"retrieval_{k}"] = v
+                wandb.log(wandb_dict)
+
+        # Text->Image
+        if self.val_tv_dataset:
+            tv_results = compute_tv_retrieval_metrics(
+                model=self.model,
+                dataset=self.val_tv_dataset,
+                subset_file=str(self.output_dir / "subset_tv_1000.json"),
+                device=self.device
+            )
+            self.logger.info(f"T/V 1000-way retrieval:\n{tv_results}")
+            if self.use_wandb:
+                wandb_dict = {}
+                for k, v in tv_results.items():
+                    wandb_dict[f"retrieval_{k}"] = v
+                wandb.log(wandb_dict)
+
+        self.logger.info("Done 1000-way retrieval evaluation.")
 
     ###########################################
     #           Main Training Loop
     ###########################################
     def train(self):
         accumulation_counter = 0
-        
         for epoch in range(self.start_epoch, self.config['num_epochs']):
+            #self.eval_1000_way_retrieval()
             # Determine training phase based on current epoch
             if epoch < self.av_focus_epochs:
                 phase = "av_focus"
@@ -946,6 +991,7 @@ class MultiModalTrainer:
             epoch_losses = []
 
             for batch_idx in pbar:
+                #self.eval_1000_way_retrieval()
                 self._update_frozen_params(self.global_step)
                 grad_norm_others = None
                 grad_norm_audio = None
@@ -1126,16 +1172,19 @@ class MultiModalTrainer:
                 
                 if self.global_step % 500 == 0:
                     gc.collect()
-                if (self.global_step > 0) and (self.global_step % self.vis_every == 0):
+                if (self.global_step % self.vis_every == 0):
                     self.visualize_samples(epoch)
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
                 if self.global_step > 0 and self.global_step % self.validation_frequency == 0:
                     val_av_loss, val_tv_loss, val_total_loss = self.validate(phase=phase)
+
                     print(f"Validation_Audio_Visual: {f'{val_av_loss:.4f}' if val_av_loss is not None else 'N/A'}, "
                           f"Validation_Text_Visual: {f'{val_tv_loss:.4f}' if val_tv_loss is not None else 'N/A'}, "
                           f"Validation_Total: {f'{val_total_loss:.4f}' if val_total_loss is not None else 'N/A'}")
+
+                    self.eval_1000_way_retrieval()
 
                 self.global_step += 1
                 
@@ -1147,6 +1196,7 @@ class MultiModalTrainer:
             if (self.val_av_dataloader or self.val_tv_dataloader):
                 self.logger.info(f"Running validation after epoch {epoch}...")
                 val_av_loss, val_tv_loss, val_total_loss = self.validate(phase=phase)
+                self.eval_1000_way_retrieval()
                 if val_total_loss is not None:
                     self.logger.info(f"Validation loss after epoch {epoch}: {val_total_loss:.4f}")
                     
@@ -1174,18 +1224,18 @@ if __name__ == "__main__":
         text_dataset_path="/home/cis/cc3m-ironic",
         audio_visual_val_data_root="/home/cis/UnGodSet", 
         text_dataset_val_path="/home/cis/cc3m-ironic-val",  
-        output_dir="./outputs-staged-training-shewhipsheregisterthekick",
+        output_dir="./outputs-revamped",#"./outputs-staged-training-shewhipsheregisterthelowrank",
         batch_size_av=22,
         batch_size_tv=22,
         num_epochs=10,  
         learning_rate=1e-4,
         use_wandb=True,
         force_new_training=False,
-        vis_every=10000,
+        vis_every=20000,
         save_every_steps=10000,
         num_workers=10,
         device="cuda",
-        gradient_accumulation_steps=5,
+        gradient_accumulation_steps=4,
         unfreeze_audio_step=5000,
         unfreeze_text_step=5000,
         unfreeze_vit_step=5000,
@@ -1193,8 +1243,8 @@ if __name__ == "__main__":
         num_vis_samples_av=24,
         num_vis_samples_tv=24,
         use_amp=True,
-        validation_frequency=10000,
-        av_focus_epochs=2,
+        validation_frequency=20000,
+        av_focus_epochs=1,
         tv_warmup_epochs=1,
         weighted_joint_epochs=2,
         av_weight_start=0.8,
