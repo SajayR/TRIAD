@@ -861,7 +861,7 @@ class MultiModalTrainer:
                     av_losses.append(loss_av.item())
                     av_contrastive_losses.append(av_contrastive.item())
                     av_reg_losses.append(av_reg.item())
-                    av_smooth_losses.append(av_smooth.item())
+                    av_smooth_losses.append(av_smooth)
                     av_sim_stats_list.append(av_sim_stats)
         
         # Only validate T/V if not in audio-visual focus phase
@@ -1335,7 +1335,7 @@ if __name__ == "__main__":
         weighted_joint_epochs=2,
         av_weight_start=0.8,
         av_weight_end=0.5,
-        aggregator_temp_start=5.0,
+        aggregator_temp_start=4.0,
         aggregator_temp_end=0.05,
         aggregator_temp_steps=100000
     )

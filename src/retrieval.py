@@ -107,14 +107,12 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
 
 def aggregator_av_a2v(a_feats, v_feats, temperature):
     # a_feats: (Na, D), v_feats: (Nv, D)
-    token_sims = torch.matmul(a_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=1).values  # shape (Na,)
-    return max_sims.mean().item()
+    token_sims = torch.matmul(a_feats, v_feats.t())
+    return temperature * torch.logsumexp(token_sims/temperature, dim=1).mean().item()
 
 def aggregator_av_v2a(a_feats, v_feats, temperature):
-    token_sims = torch.matmul(a_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=0).values  # shape (Nv,)
-    return max_sims.mean().item()
+    token_sims = torch.matmul(a_feats, v_feats.t())
+    return temperature * torch.logsumexp(token_sims/temperature, dim=0).mean().item()
 
 def compute_recall_at_k(sim_matrix):
     """
@@ -156,7 +154,7 @@ def compute_av_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     indices = select_subset_indices(dataset, subset_file, subset_size=1000)
     audio_feats_list, video_feats_list, _ = embed_av_subset(model, dataset, indices, device=device, batch_size=8)
     N = len(indices)
-    temperature = model.temperature.item()
+    temperature = model.aggregator_temp  # Instead of model.temperature.item()
 
     # -------------- A->V --------------
     print(f"Computing A->V retrieval on {N} items ...")
@@ -195,14 +193,12 @@ def compute_av_retrieval_metrics(model, dataset, subset_file, device='cuda'):
 # For Text->Visual retrieval:
 # --------------------------------------------------------------------------- #
 def aggregator_tv_t2v(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=1).values
-    return max_sims.mean().item()
+    token_sims = torch.matmul(t_feats, v_feats.t())
+    return temperature * torch.logsumexp(token_sims/temperature, dim=1).mean().item()
 
 def aggregator_tv_v2t(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=0).values
-    return max_sims.mean().item()
+    token_sims = torch.matmul(t_feats, v_feats.t())
+    return temperature * torch.logsumexp(token_sims/temperature, dim=0).mean().item()
 
 def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8):
     """
@@ -265,7 +261,7 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     indices = select_subset_indices(dataset, subset_file, subset_size=1000)
     text_feats_list, image_feats_list = embed_tv_subset(model, dataset, indices, device=device, batch_size=8)
     N = len(indices)
-    temperature = model.temperature.item()
+    temperature = model.aggregator_temp  # Instead of model.temperature.item()
 
     # T->V
     print(f"Computing T->V retrieval on {N} items ...")
