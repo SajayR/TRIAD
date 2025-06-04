@@ -17,7 +17,7 @@ def select_subset_indices(dataset, subset_file, subset_size=1000):
 
     if os.path.exists(subset_file):
         with open(subset_file, 'r') as f:
-            indices = json.load(f)  # e.g. a list of ints
+            indices = json.load(f)
         print(f"Loaded {len(indices)} subset indices from {subset_file}")
         return indices
     else:
@@ -44,7 +44,7 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
     video_paths_list = [None]*len(subset_indices)
 
     def collate_eval_fn(batch):
-        # This is basically the same as your collate_fn but with apply_augmentation=False
+
         frames = []
         audios = []
         paths = []
@@ -52,7 +52,7 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
             frames.append(item['video_frames'])
             audios.append(item['audio'])
             paths.append(item['video_path'])
-        # pad audio
+
         max_len = max(a.shape[0] for a in audios)
         audio_padded = torch.zeros(len(audios), max_len)
         for i,aud in enumerate(audios):
@@ -71,7 +71,7 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
             return len(self.indices)
         def __getitem__(self, idx):
             real_idx = self.indices[idx]
-            # apply_augmentation=False to ensure deterministic transforms
+
             sample = self.base.__getitem__(real_idx, apply_augmentation=False)
             return sample
 
@@ -83,13 +83,12 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
     idx_offset = 0
     with torch.no_grad():
         for batch in tqdm(loader, desc="Embedding AV subset"):
-            frames = batch['frames'].to(device)   # shape [B, 3, 224, 224]
-            audio  = batch['audio'].to(device)    # shape [B, T]
+            frames = batch['frames'].to(device)
+            audio  = batch['audio'].to(device)
             paths  = batch['paths']
 
-            # Pass through embedder
-            vfeats = model.visual_embedder(frames)  # (B, Nv, D)
-            afeats = model.audio_embedder(audio)     # (B, Na, D)
+            vfeats = model.visual_embedder(frames)
+            afeats = model.audio_embedder(audio)
 
             vfeats = F.normalize(vfeats, dim=2)
             afeats = F.normalize(afeats, dim=2)
@@ -104,16 +103,15 @@ def embed_av_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
 
     return audio_feats_list, video_feats_list, video_paths_list
 
-
 def aggregator_av_a2v(a_feats, v_feats, temperature):
-    # a_feats: (Na, D), v_feats: (Nv, D)
+
     token_sims = torch.matmul(a_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=1).values  # shape (Na,)
+    max_sims = token_sims.max(dim=1).values
     return max_sims.mean().item()
 
 def aggregator_av_v2a(a_feats, v_feats, temperature):
     token_sims = torch.matmul(a_feats, v_feats.t()) / temperature
-    max_sims = token_sims.max(dim=0).values  # shape (Nv,)
+    max_sims = token_sims.max(dim=0).values
     return max_sims.mean().item()
 
 def compute_recall_at_k(sim_matrix):
@@ -128,12 +126,12 @@ def compute_recall_at_k(sim_matrix):
     ranks = []
     for i in range(N):
         row = sim_matrix[i]
-        # Sort in descending order
+
         sorted_indices = np.argsort(-row)
-        rank_of_correct = np.where(sorted_indices == i)[0][0]  # 0-based
+        rank_of_correct = np.where(sorted_indices == i)[0][0]
         ranks.append(rank_of_correct)
     ranks = np.array(ranks)
-    # Compute recall
+
     r1  = np.mean(ranks < 1)
     r5  = np.mean(ranks < 5)
     r10 = np.mean(ranks < 10)
@@ -158,7 +156,6 @@ def compute_av_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     N = len(indices)
     temperature = model.temperature.item()
 
-    # -------------- A->V --------------
     print(f"Computing A->V retrieval on {N} items ...")
     sim_mat_a2v = np.zeros((N, N), dtype=np.float32)
     for i in tqdm(range(N), desc="Aggregator A->V"):
@@ -168,7 +165,6 @@ def compute_av_retrieval_metrics(model, dataset, subset_file, device='cuda'):
             sim_mat_a2v[i, j] = aggregator_av_a2v(afeats_i, vfeats_j, temperature)
     av_metrics = compute_recall_at_k(sim_mat_a2v)
 
-    # -------------- V->A --------------
     print(f"Computing V->A retrieval on {N} items ...")
     sim_mat_v2a = np.zeros((N, N), dtype=np.float32)
     for i in tqdm(range(N), desc="Aggregator V->A"):
@@ -191,9 +187,6 @@ def compute_av_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     }
     return results
 
-# --------------------------------------------------------------------------- #
-# For Text->Visual retrieval:
-# --------------------------------------------------------------------------- #
 def aggregator_tv_t2v(t_feats, v_feats, temperature):
     token_sims = torch.matmul(t_feats, v_feats.t()) / temperature
     max_sims = token_sims.max(dim=1).values
@@ -229,7 +222,7 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
             return len(self.indices)
         def __getitem__(self, idx):
             real_idx = self.indices[idx]
-            # This returns (image, caption), no random transforms
+
             return self.base.__getitem__(real_idx)
 
     subset_ds = TVSubset(dataset, subset_indices)
@@ -241,12 +234,12 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
     with torch.no_grad():
         for batch_images, batch_captions in tqdm(loader, desc="Embedding TV subset"):
             batch_images = batch_images.to(device)
-            vfeats = model.visual_embedder(batch_images)  # (B, Nv, D)
-            tfeats, attn_mask = model.text_embedder(batch_captions)  # (B, Nt, D), (B, Nt)
+            vfeats = model.visual_embedder(batch_images)
+            tfeats, attn_mask = model.text_embedder(batch_captions)
 
             B = vfeats.shape[0]
             for b in range(B):
-                # slice out valid tokens
+
                 n_tokens = attn_mask[b].sum().item()
                 text_feats_list[idx_offset + b] = tfeats[b, :n_tokens].cpu()
                 image_feats_list[idx_offset + b] = vfeats[b].cpu()
@@ -267,7 +260,6 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     N = len(indices)
     temperature = model.temperature.item()
 
-    # T->V
     print(f"Computing T->V retrieval on {N} items ...")
     sim_mat_t2v = np.zeros((N, N), dtype=np.float32)
     for i in tqdm(range(N), desc="Aggregator T->V"):
@@ -277,7 +269,6 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
             sim_mat_t2v[i, j] = aggregator_tv_t2v(tfeats_i, vfeats_j, temperature)
     tv_metrics = compute_recall_at_k(sim_mat_t2v)
 
-    # V->T
     print(f"Computing V->T retrieval on {N} items ...")
     sim_mat_v2t = np.zeros((N, N), dtype=np.float32)
     for i in tqdm(range(N), desc="Aggregator V->T"):
