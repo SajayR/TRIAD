@@ -376,4 +376,4 @@ if __name__ == "__main__":
     print("Running quick tests for AudioVisualizer and TextVisualizer...")
 
     _quick_text_visual_test()
-    print("All tests complete! Check the output files for visualizations.")
+    print("All tests complete! Check the output files for visualizations.")#

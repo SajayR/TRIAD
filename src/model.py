@@ -664,4 +664,4 @@ if __name__ == "__main__":
         print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
 
     
-    print("MultiModalModel test completed.")
+    print("MultiModalModel test completed.")#
