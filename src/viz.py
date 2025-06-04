@@ -1,4 +1,3 @@
-# viz.py
 
 import torch
 import torch.nn.functional as F
@@ -9,10 +8,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import ffmpeg 
 
-
-#########################################################
-#                   AUDIO VISUALIZER
-#########################################################
 class AudioVisualizer:
     """
     Creates audio-visual attention overlays (or videos) given a model
@@ -23,7 +18,6 @@ class AudioVisualizer:
         self.image_size = image_size
         self.num_patches = image_size // patch_size
 
-        # Transparent -> blue -> red -> yellow
         colors = [
             (0, 0, 0, 0),
             (0, 0, 1, 0.5),
@@ -49,25 +43,24 @@ class AudioVisualizer:
         """
         model.eval()
         with torch.no_grad():
-            # shape => (1, 3, H, W) and (1, T)
+
             frame = frame.unsqueeze(0)
             audio = audio.unsqueeze(0)
-            visual_feats = model.visual_embedder(frame)   # (1, Nv, D)
-            audio_feats = model.audio_embedder(audio)     # (1, Na, D)
+            visual_feats = model.visual_embedder(frame)
+            audio_feats = model.audio_embedder(audio)
 
-            # token-sims => (1, Na, Nv)
             sim = model.compute_similarity_matrix(audio_feats, visual_feats).squeeze(0)
-            # convert patches to heatmaps
+
             attention_maps = self.patches_to_heatmaps(sim)
 
-        return attention_maps  # shape: (Na, H, W)
+        return attention_maps
 
     def patches_to_heatmaps(self, patch_attention):
         """Upsample patch-level attention (Na, Nv) into pixel-level heatmaps (Na, H, W)."""
         Na, Nv = patch_attention.shape
         patches = patch_attention.reshape(Na, self.num_patches, self.num_patches)
         patches = patches ** 2
-        # Upsample to 224x224
+
         heatmaps = F.interpolate(
             patches.unsqueeze(1),
             size=(self.image_size, self.image_size),
@@ -75,14 +68,14 @@ class AudioVisualizer:
             align_corners=False
         ).squeeze(1)
 
-        return heatmaps  # shape: (Na, H, W)
+        return heatmaps
 
     def create_overlay_frame(self, frame_np: np.ndarray, heatmap: np.ndarray, alpha=0.30):
         """Overlay a heatmap onto an RGB frame."""
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
 
-        heatmap_colored = self.cmap(heatmap)[..., :3]  # drop alpha, shape => (H, W, 3)
+        heatmap_colored = self.cmap(heatmap)[..., :3]
         heatmap_bgr = (heatmap_colored * 255).astype(np.uint8)
 
         overlay = ((1 - alpha) * frame_np + alpha * heatmap_bgr).astype(np.uint8)
@@ -106,14 +99,14 @@ class AudioVisualizer:
           3) If `video_path` is given, we use ffmpeg to mux the *original audio* from `video_path` into our new frames.
              This replicates the logic you had in your original code.
         """
-        #reshape so it's (1, C, H, W):
+
         if frame.ndim == 3:
             frame = frame.unsqueeze(0)
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
         
         self._validate_inputs(frame, audio)
-        attention_maps = self.get_attention_maps(model, frame, audio)  # calls compute_similarity_matrix => upsample
+        attention_maps = self.get_attention_maps(model, frame, audio)
         frame_np = frame.squeeze(0).permute(1, 2, 0).cpu().numpy()
         mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
         std  = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
@@ -125,7 +118,7 @@ class AudioVisualizer:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (self.image_size, self.image_size))
         for heatmap in attention_maps:
-            # shape => (H, W)
+
             overlay = self.create_overlay_frame(frame_np, heatmap.cpu().numpy())
             overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
             writer.write(overlay_bgr)
@@ -143,7 +136,7 @@ class AudioVisualizer:
                 ).overwrite_output()
                 stream.run(capture_stdout=True, capture_stderr=True)
                 Path(temp_video_path).unlink()
-                #print(f"Saved attention video with original audio to {output_path}")
+
             except ffmpeg.Error as e:
                 print("Error in ffmpeg muxing:", e.stderr.decode('utf8'))
                 print("Falling back to silent .mp4")
@@ -180,33 +173,31 @@ class AudioVisualizer:
         frame_np = (frame_np * std + mean) * 255
         frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
         with torch.no_grad():
-            batch_frame = frame.unsqueeze(0).to(next(model.parameters()).device)   # (1,3,H,W)
-            batch_audio = audio.unsqueeze(0).to(next(model.parameters()).device)   # (1,T)
+            batch_frame = frame.unsqueeze(0).to(next(model.parameters()).device)
+            batch_audio = audio.unsqueeze(0).to(next(model.parameters()).device)
             
-            visual_feats = model.visual_embedder(batch_frame)   # (1, Nv, D)
-            audio_feats  = model.audio_embedder(batch_audio)    # (1, Na, D)
+            visual_feats = model.visual_embedder(batch_frame)
+            audio_feats  = model.audio_embedder(batch_audio)
 
-            # => (1, Na, Nv)
             token_sims = model.compute_similarity_matrix(audio_feats, visual_feats)
-            token_sims = token_sims.squeeze(0)  # (Na, Nv)
+            token_sims = token_sims.squeeze(0)
         
         Na, Nv = token_sims.shape
         if Na == 0:
             print("No audio tokens found! Possibly zero-length audio input.")
             return
 
-        # If the audio has fewer tokens than requested, clamp
         num_tokens_to_show = min(num_tokens_to_show, Na)
         selected_indices = np.linspace(0, Na-1, num_tokens_to_show).astype(int)
         patch_size = self.patch_size
         patches = token_sims.reshape(Na, self.num_patches, self.num_patches)
-        patches = patches ** 2  # square for contrast
+        patches = patches ** 2
         heatmaps = F.interpolate(
             patches.unsqueeze(1),
             size=(self.image_size, self.image_size),
             mode='bilinear',
             align_corners=False
-        ).squeeze(1)  # shape => (Na, 224, 224)
+        ).squeeze(1)
         rows = (num_tokens_to_show + 3) // 4
         cols = min(4, num_tokens_to_show)
         fig, axes = plt.subplots(rows, cols, figsize=(4.5*cols, 4.5*rows))
@@ -228,7 +219,7 @@ class AudioVisualizer:
         if output_path:
             plt.savefig(output_path)
             plt.close()
-            #print(f"Saved audio attention snapshot to {output_path}")
+
         else:
             plt.show()
 
@@ -238,15 +229,11 @@ class AudioVisualizer:
         """
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         heatmap = np.power(heatmap, 2)
-        heatmap_colored = self.cmap(heatmap)[...,:3]  # shape (H, W, 3)
+        heatmap_colored = self.cmap(heatmap)[...,:3]
         heatmap_bgr = (heatmap_colored * 255).astype(np.uint8)
         overlay = ((1 - alpha) * frame_np + alpha * heatmap_bgr).astype(np.uint8)
         return overlay
 
-
-#########################################################
-#                   TEXT VISUALIZER
-#########################################################
 class TextVisualizer:
     """
     Creates text-visual overlays for image + token-level text attention,
@@ -257,7 +244,6 @@ class TextVisualizer:
         self.image_size = image_size
         self.num_patches = image_size // patch_size
 
-        # Transparent -> blue -> red -> yellow
         colors = [
             (0, 0, 0, 0),
             (0, 0, 1, 0.5),
@@ -273,15 +259,15 @@ class TextVisualizer:
         """
         model.eval()
         with torch.no_grad():
-            # shape => (1, 3, H, W) and text => single string in a list
+
             frame_batched = frame.unsqueeze(0)
             text_list = [text]
 
-            visual_feats = model.visual_embedder(frame_batched)        # (1, Nv, D)
-            text_feats, text_mask = model.text_embedder(text_list)     # (1, Nt, D), (1, Nt)
+            visual_feats = model.visual_embedder(frame_batched)
+            text_feats, text_mask = model.text_embedder(text_list)
 
-            sim_matrix = model.compute_similarity_matrix(text_feats, visual_feats)  # (1, Nt, Nv)
-            sim_matrix = sim_matrix.squeeze(0)  # (Nt, Nv)
+            sim_matrix = model.compute_similarity_matrix(text_feats, visual_feats)
+            sim_matrix = sim_matrix.squeeze(0)
             valid_tokens_count = text_mask.sum().item()  
             sim_matrix = sim_matrix[:valid_tokens_count]
 
@@ -307,7 +293,7 @@ class TextVisualizer:
             align_corners=False
         ).squeeze(1)
 
-        return heatmaps  # (Nt, H, W)
+        return heatmaps
 
     def _create_overlay_frame(self, frame_np, heatmap, alpha=0.30):
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
@@ -329,7 +315,6 @@ class TextVisualizer:
         frame_np = (frame_np * std + mean) * 255
         frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
 
-        # Layout: up to 4 columns
         cols = min(4, Nt)
         rows = (Nt + cols - 1) // cols
 
@@ -353,14 +338,10 @@ class TextVisualizer:
         if output_path:
             plt.savefig(output_path)
             plt.close()
-            #print(f"Saved token attention figure to {output_path}")
+
         else:
             plt.show()
 
-
-#########################################################
-#                   QUICK TEST (MAIN)
-#########################################################
 def _quick_audio_visual_test():
     from model import MultiModalModel
     model = MultiModalModel()
@@ -369,13 +350,12 @@ def _quick_audio_visual_test():
     mean = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
     frame = (frame - mean) / std
-    #audio = torch.randn(16331)  # 1 sec at 16kHz
+
     t = torch.linspace(0, 2*torch.pi, 16331)
-    audio = torch.sin(2 * torch.pi * 440 * t) # [16331]
+    audio = torch.sin(2 * torch.pi * 440 * t)
     viz = AudioVisualizer()
     out_file = "test_audio_attention.mp4"
     viz.make_attention_video(model, frame, audio, out_file, fps=5)
-
 
 def _quick_text_visual_test():
     from model import MultiModalModel
@@ -392,9 +372,8 @@ def _quick_text_visual_test():
     out_file = "test_text_attention.png"
     viz.plot_token_attentions(model, frame, text, output_path=out_file)
 
-
 if __name__ == "__main__":
     print("Running quick tests for AudioVisualizer and TextVisualizer...")
-    #_quick_audio_visual_test()
+
     _quick_text_visual_test()
     print("All tests complete! Check the output files for visualizations.")

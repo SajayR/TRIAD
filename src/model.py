@@ -1,4 +1,3 @@
-# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,9 +19,6 @@ from peft import (
     get_peft_model,
     TaskType,
 )
-#################################################################
-#                   Audio Embedder
-#################################################################
 class AudioEmbedder(nn.Module):
     """
     Pre-trained HuBERT to extract audio features from raw audio (16kHz).
@@ -32,7 +28,6 @@ class AudioEmbedder(nn.Module):
         super().__init__()
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")  
         self.hubert = HubertModel.from_pretrained(hubert_name)
-        #self.projection = nn.Linear(self.hubert.config.hidden_size, embedding_dim)
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 512)
         self.layer_norm = nn.LayerNorm(512)
@@ -56,8 +51,8 @@ class AudioEmbedder(nn.Module):
                 Na = number of audio tokens (T/320 for Hubert)
                 D = embedding_dim
         """
-        if len(audio_input.shape) == 3:  # shape: [B, 1, T]
-            audio_input = audio_input.squeeze(0)  # squeeze first dim to get [B, T]
+        if len(audio_input.shape) == 3:
+            audio_input = audio_input.squeeze(0)
         inputs = self.processor(
             audio_input, 
             return_tensors="pt",
@@ -68,16 +63,12 @@ class AudioEmbedder(nn.Module):
         device = next(self.parameters()).device
         inputs = inputs.to(device)
         
-        hubert_output = self.hubert(inputs).last_hidden_state  # (B, T', hidden_size)
+        hubert_output = self.hubert(inputs).last_hidden_state
         
-        audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))  # (B, T', D)
+        audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))
         
         return audio_feats
 
-
-#################################################################
-#                   Text Embedder
-#################################################################
 class TextEmbedder(nn.Module):
     """
     pre-trained BERT-like model to extract text features.
@@ -120,16 +111,12 @@ class TextEmbedder(nn.Module):
         for k in inputs:
             inputs[k] = inputs[k].to(device)
 
-        outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
+        outputs = self.encoder(**inputs)
         hidden_states = outputs.last_hidden_state
-        text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
+        text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))
         
         return text_feats, inputs["attention_mask"]
 
-
-#################################################################
-#                   Visual Embedder
-#################################################################
 class ViTEmbedder(nn.Module):
     """
     DINOv2to extract patch embeddings from an image.
@@ -143,7 +130,7 @@ class ViTEmbedder(nn.Module):
         self.projection1 = nn.Linear(self.model.embed_dim, 512)
         self.layer_norm = nn.LayerNorm(512)
         self.projection2 = nn.Linear(512, embedding_dim)
-        #self.dropout = nn.Dropout(dropout_prob)
+
         self.patch_dropout_rate = dropout_prob
         self.patch_dropout = self.patch_dropout
         for param in self.model.parameters():
@@ -166,21 +153,21 @@ class ViTEmbedder(nn.Module):
         B, N, D = x.shape
         dtype = x.dtype
             
-        # Create keep mask
+
         keep_mask = torch.bernoulli(
             torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
         ).bool()
         
-        # List to store processed batch items
+
         output_tensors = []
         
-        # Process each item in batch
+
         for i in range(B):
-            # Select tokens to keep for this batch item
+
             kept_tokens = x[i][keep_mask[i]]
             output_tensors.append(kept_tokens)
         
-        # Pad sequences to longest in batch
+
         max_len = max(tensor.size(0) for tensor in output_tensors)
         padded_outputs = []
         
@@ -191,7 +178,7 @@ class ViTEmbedder(nn.Module):
             else:
                 padded_outputs.append(tensor)
         
-        # Stack back into batch
+
         x = torch.stack(padded_outputs, dim=0)
         return x
 
@@ -204,17 +191,17 @@ class ViTEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        #print(f"x shape: {x.shape}")
-        if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
-            x = x.squeeze(0)  # get [1, 3, 224, 224]
+
+        if len(x.shape) == 5:
+            x = x.squeeze(0)
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
         patches = self.model.get_intermediate_layers(x, n=1)[0]  
         
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        #feats = self.dropout(feats)
+
         feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        #print(f"feats shape: {feats.shape}")
+
         return feats
 
 class ViTLoRAEmbedder(nn.Module):
@@ -227,26 +214,24 @@ class ViTLoRAEmbedder(nn.Module):
                  embedding_dim=512, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
         super().__init__()
         
-        # Load the base model
+
         self.model = torch.hub.load(model_name, arch)
         print(f"Using DINOv2 model with LoRA adapters: {arch}")
     
         
-        # Freeze the base model parameters
+
         for param in self.model.parameters():
             param.requires_grad = False
             
-        # Define which layers to apply LoRA to - now including both attention and MLP layers
+
         lora_target_modules = [
-            # Attention layers
+
             "attn.qkv",
             "attn.proj",
-            # MLP layers
-            #"mlp.fc1",
-            #"mlp.fc2",
+
         ]
         
-        # LoRA configuration
+
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             inference_mode=False,
@@ -254,12 +239,12 @@ class ViTLoRAEmbedder(nn.Module):
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             lora_dropout=0.0,
-            fan_in_fan_out=True,  # Add this
-            bias="none",          # Add this
-            modules_to_save=None  # Add this to prevent parameter duplication
+            fan_in_fan_out=True,
+            bias="none",
+            modules_to_save=None
         )
         
-        # Apply LoRA to the model
+
         self.model = get_peft_model(self.model, lora_config)
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -272,7 +257,7 @@ class ViTLoRAEmbedder(nn.Module):
         self.patch_dropout = self.patch_dropout
         for param in self.model.parameters():
             param.requires_grad = True
-        #set base model to false
+
         for param in self.model.base_model.parameters():
             param.requires_grad = False
         for param in self.projection1.parameters():
@@ -293,21 +278,21 @@ class ViTLoRAEmbedder(nn.Module):
         B, N, D = x.shape
         dtype = x.dtype
             
-        # Create keep mask
+
         keep_mask = torch.bernoulli(
             torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
         ).bool()
         
-        # List to store processed batch items
+
         output_tensors = []
         
-        # Process each item in batch
+
         for i in range(B):
-            # Select tokens to keep for this batch item
+
             kept_tokens = x[i][keep_mask[i]]
             output_tensors.append(kept_tokens)
         
-        # Pad sequences to longest in batch
+
         max_len = max(tensor.size(0) for tensor in output_tensors)
         padded_outputs = []
         
@@ -318,7 +303,7 @@ class ViTLoRAEmbedder(nn.Module):
             else:
                 padded_outputs.append(tensor)
         
-        # Stack back into batch
+
         x = torch.stack(padded_outputs, dim=0)
         return x
 
@@ -331,21 +316,18 @@ class ViTLoRAEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        if len(x.shape) == 5:  # shape: [1, 1, 3, 224, 224]
-            x = x.squeeze(0)  # get [1, 3, 224, 224]
+        if len(x.shape) == 5:
+            x = x.squeeze(0)
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
             
-        # Use intermediate layers for feature extraction - same as original
+
         patches = self.model.get_intermediate_layers(x, n=1)[0]
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         feats = self.patch_dropout(feats, self.patch_dropout_rate)
         
         return feats
 
-#################################################################
-#                   Unified MultiModalModel
-#################################################################
 class MultiModalModel(nn.Module):
     def __init__(
         self, 
@@ -362,16 +344,14 @@ class MultiModalModel(nn.Module):
         self.audio_embedder = AudioEmbedder(embedding_dim=512, hubert_name=audio_model_name)
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
-        #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
+
         self.temperature = nn.Parameter(torch.tensor(temperature))
 
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
-    ######################################################
-    #               Shared Utilities
-    ######################################################
+
     def compute_similarity_matrix(self, feats1, feats2):
         """
         Generic token-level dot-product similarity between feats1 and feats2.
@@ -379,17 +359,14 @@ class MultiModalModel(nn.Module):
         feats2: (B, N2, D)
         Returns sim: (B, N1, N2)
         """ 
-        # ONLY NORMALIZE DURING INFERENCE, TRAINING CAUSES MODEL COLLAPSE
+
         feats1 = F.normalize(feats1, dim=-1)
         feats2 = F.normalize(feats2, dim=-1)
-        #always run in full precision
+
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
             return sim * self.temperature
 
-    ######################################################
-    #               AUDIO-VISUAL PATH
-    ######################################################
     def compute_all_similarities_av(self, audio_feats, visual_feats):
         """
         Cross-batch approach: compute pairwise similarities for all 
@@ -403,14 +380,14 @@ class MultiModalModel(nn.Module):
             token_sims: (B, B, Na, Nv) raw token-level sims
         """
         B = audio_feats.shape[0]
-        # Expand to shape (B, B, Na, D) and (B, B, Nv, D)
+
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
-        # dot product => (B, B, Na, Nv)
+
         token_sims = torch.matmul(af, vf.transpose(2, 3)) * self.temperature
-        # max over visual dimension => (B, B, Na)
+
         max_sims = torch.max(token_sims, dim=3)[0]
-        # mean over audio dimension => (B, B)
+
         clip_sims = torch.mean(max_sims, dim=2)
         return clip_sims, token_sims
 
@@ -425,8 +402,8 @@ class MultiModalModel(nn.Module):
             Scalar temporal smoothness loss
         """
         B = token_sims.shape[0]
-        diagonal_sims = torch.stack([token_sims[i, i] for i in range(B)])  # Shape: (B, Na, Nv)
-        temporal_diffs = diagonal_sims[:, 1:] - diagonal_sims[:, :-1]  # Shape: (B, Na-1, Nv)
+        diagonal_sims = torch.stack([token_sims[i, i] for i in range(B)])
+        temporal_diffs = diagonal_sims[:, 1:] - diagonal_sims[:, :-1]
         smoothness_loss = torch.mean(temporal_diffs ** 2)
         return smoothness_loss
 
@@ -436,17 +413,15 @@ class MultiModalModel(nn.Module):
           1. Non-negative pressure (we clamp negative sims in [-20, 0])
           2. Temperature constraints (optional if you're using a trainable temperature)
         """
-        # 1) Non-negative pressure
+
         neg_sims = torch.clamp(token_sims, min=-60, max=0)
         l_nonneg = torch.mean(neg_sims ** 2)
 
-        # 2) Temperature calibration
-        #    force it between [1,4] or sumn man idk.
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(self.temperature), min=0) ** 2
         temp_high = torch.clamp(torch.log(self.temperature) 
                                 - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
-        l_cal = temp_low# + temp_high
+        l_cal = temp_low
 
         l_smooth = self.compute_temporal_smoothness_loss(token_sims)
         reg_loss = (20 * l_cal + 0.15 * l_nonneg + 0.01 * l_smooth)
@@ -456,25 +431,25 @@ class MultiModalModel(nn.Module):
         B = clip_sims.shape[0]
         labels = torch.arange(B, device=clip_sims.device)
         
-        # Extract positive and negative similarities
-        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+
+        pos_sims = torch.diagonal(clip_sims)
         
-        # Create a mask for negative pairs (all except diagonal)
+
         mask = torch.ones_like(clip_sims, dtype=torch.bool)
         mask.fill_diagonal_(0)
-        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        neg_sims = clip_sims[mask]
         
-        # Compute statistics
+
         pos_sim_mean = pos_sims.mean().item()
         pos_sim_std = pos_sims.std().item()
         neg_sim_mean = neg_sims.mean().item()
         neg_sim_std = neg_sims.std().item()
         hardest_negative = neg_sims.max().item()
         
-        # Calculate separation (gap between positive and negative means)
+
         separation = pos_sim_mean - neg_sim_mean
         
-        # Original contrastive loss calculation
+
         log_prob_a2v = F.log_softmax(clip_sims, dim=1)
         losses_a2v = -log_prob_a2v[torch.arange(B), labels]
 
@@ -484,7 +459,7 @@ class MultiModalModel(nn.Module):
         contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
         reg_loss, l_smooth = self.compute_regularization_losses_av(token_sims)
         
-        # Return similarity stats along with losses
+
         similarity_stats = {
             "av_pos_sim_mean": pos_sim_mean,
             "av_pos_sim_std": pos_sim_std,
@@ -504,18 +479,14 @@ class MultiModalModel(nn.Module):
         If training: returns scalar loss
         If eval: returns token_sims
         """
-        #print(audio.shape)
+
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            visual_feats = self.visual_embedder(frames)     # (B, Nv, D)
-            audio_feats = self.audio_embedder(audio)         # (B, Na, D)
+            visual_feats = self.visual_embedder(frames)
+            audio_feats = self.audio_embedder(audio)
         with torch.cuda.amp.autocast(enabled=False):
             clip_sims, token_sims = self.compute_all_similarities_av(audio_feats, visual_feats)
             return self.compute_contrastive_loss_av(clip_sims, token_sims)
 
-
-    ######################################################
-    #               TEXT-VISUAL PATH
-    ######################################################
     def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
         """
         cross-batch approach: (text_i, visual_j)
@@ -528,16 +499,15 @@ class MultiModalModel(nn.Module):
             token_sims: (B, B, Nt, Nv)
         """
         B = text_feats.shape[0]
-        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-        # token-level similarity => (B, B, Nt, Nv)
+        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)
+
         token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
-        # max over visual dimension => (B, B, Nt)
+
         max_sims = torch.max(token_sims, dim=3)[0]
-        # we need masked mean over Nt
-        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
+
         mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
+        masked_sum = (max_sims * mask).sum(dim=2)
         valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
         clip_sims = masked_sum / valid_tokens
 
@@ -548,25 +518,25 @@ class MultiModalModel(nn.Module):
         1) negative sims near zero
         2) patch usage sparsity on positive pairs
         """
-        # (B, B, Nt, Nv)
+
         B = token_sims.shape[0]
-        # 1) negative clamp
+
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims**2)
-        # 2) patch usage sparsity (for the diagonal pairs only)
+
         positive_sims = []
         for i in range(B):
-            # shape (Nt, Nv) from token_sims[i, i]
+
             positive_sims.append(token_sims[i, i])
         if len(positive_sims) == 0:
             return 0.15 * l_nonneg
-        positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
-        # softmax over patches => (B, Nt, Nv)
+        positive_sims = torch.stack(positive_sims, dim=0)
+
         patch_probs = F.softmax(positive_sims, dim=-1)
-        # fraction usage per patch => sum over Nt, then / Nt => (B, Nv)
+
         patch_fraction = patch_probs.sum(dim=1) / patch_probs.shape[1]
-        # penalize if fraction > threshold
-        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)  # (B, Nv)
+
+        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)
         loss_sparsity = (excess ** 2).mean()
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
         return reg_loss
@@ -579,30 +549,29 @@ class MultiModalModel(nn.Module):
         B = clip_sims.shape[0]
         labels = torch.arange(B, device=clip_sims.device)
         
-        # Extract positive and negative similarities
-        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
+
+        pos_sims = torch.diagonal(clip_sims)
         
-        # Create a mask for negative pairs (all except diagonal)
+
         mask = torch.ones_like(clip_sims, dtype=torch.bool)
         mask.fill_diagonal_(0)
-        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
+        neg_sims = clip_sims[mask]
         
-        # Compute statistics
+
         pos_sim_mean = pos_sims.mean().item()
         pos_sim_std = pos_sims.std().item()
         neg_sim_mean = neg_sims.mean().item()
         neg_sim_std = neg_sims.std().item()
         hardest_negative = neg_sims.max().item()
         
-        # Calculate separation (gap between positive and negative means)
+
         separation = pos_sim_mean - neg_sim_mean
         
-        # Original contrastive loss calculation
-        # text->visual
+
+
         log_prob_t2v = F.log_softmax(clip_sims, dim=1)
         losses_t2v = -log_prob_t2v[torch.arange(B), labels]
 
-        # visual->text
         log_prob_v2t = F.log_softmax(clip_sims.t(), dim=1)
         losses_v2t = -log_prob_v2t[torch.arange(B), labels]
 
@@ -611,7 +580,7 @@ class MultiModalModel(nn.Module):
 
         total_loss = contrastive_loss + reg_loss
         
-        # Return similarity stats along with losses
+
         similarity_stats = {
             "tv_pos_sim_mean": pos_sim_mean,
             "tv_pos_sim_std": pos_sim_std,
@@ -632,16 +601,15 @@ class MultiModalModel(nn.Module):
         else: return (sim_matrix, attention_mask)
         """
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):   
-            visual_feats = self.visual_embedder(frames)              # (B, Nv, D)
-            text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
+            visual_feats = self.visual_embedder(frames)
+            text_feats, attention_mask = self.text_embedder(text_list)
         with torch.cuda.amp.autocast(enabled=False):
             clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
             return self.compute_contrastive_loss_tv(clip_sims, token_sims)
 
-
     def forward(self, frames=None, audio=None, text_list=None):
         assert frames is not None or audio is not None or text_list is not None, "At least one modality must be provided"
-        # we need to conver the image into the correct format and shit
+
         assert frames is not str, "Frames Cross-modal retrieval using 1000 evaluation videos from the PlacesAudio and AudioSet validation datasets. DenseAV dramatically outperforms all approaches tested in all metrics. Most notably, the state-of-the-art image retrieval foundation model, ImageBind, is incapable of recognizing speech. We note that the ImageBind authors do not publish retraining code, so we evaluate their largest pretrained model. Models with a * indicate that they have been previously reported in the literature. Other numbers are calculated by using pretrained models when available or from training with the author’s official training scripts.should be a path to an image"
         if frames is not None:
             image = Image.open(frames).convert('RGB')
@@ -660,7 +628,6 @@ class MultiModalModel(nn.Module):
         if text_list is not None:
             embeddings['text_feats'], _ = self.text_embedder(text_list)
 
-        # if two or more modalities are present, we compute the similarity matrix 
         if frames is not None and text_list is not None:
             embeddings['vis_text_sim_matrix'] = self.compute_similarity_matrix(embeddings['text_feats'], embeddings['visual_feats'])
         if audio is not None and frames is not None:
@@ -669,9 +636,6 @@ class MultiModalModel(nn.Module):
             embeddings['text_audio_sim_matrix'] = self.compute_similarity_matrix(embeddings['text_feats'], embeddings['audio_feats'])
         return embeddings
 
-#################################################################
-#                        Quick Test
-#################################################################
 if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
     model = MultiModalModel(
@@ -683,8 +647,8 @@ if __name__ == "__main__":
         visual_dropout_prob=0.2
     )
     batch_size = 2
-    dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
-    dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
+    dummy_frames = torch.randn(batch_size, 3, 224, 224)
+    dummy_audio  = torch.randn(batch_size, 16000)
     dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
     model.train()
     av_loss, _, _, _, _ = model.forward_audio_visual(dummy_frames, dummy_audio)
@@ -695,9 +659,9 @@ if __name__ == "__main__":
     with torch.no_grad():
         av_sims = model.forward_audio_visual(dummy_frames, dummy_audio)
         print(f"Audio-Visual similarities shape: {av_sims.shape}")  
-        # expected => (B, Na, Nv)
+
         tv_sims, tv_mask = model.forward_text_visual(dummy_frames, dummy_texts)
         print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
-        # expected => (B, Nt, Nv), (B, Nt)
+
     
     print("MultiModalModel test completed.")
